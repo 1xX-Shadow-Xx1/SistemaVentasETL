@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SistemaVentas.Data/SistemaVentas.Data.csproj" />
+  <Project Path="SistemaVentasETL.Worker/SistemaVentasETL.WkService.csproj" />
+</Solution>
