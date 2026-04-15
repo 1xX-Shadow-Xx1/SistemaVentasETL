@@ -42,17 +42,23 @@ namespace SistemaVentasETL.Worker
                 await staging.SaveAsync(clientesApi, "API", "Clientes_API");
                 _logger.LogInformation("API extraída: {Count} registros.", clientesApi.Count());
 
-                // Extracción desde Base de Datos (Comentado hasta que tengas la BD real conectada)
-                
+                // Extracción desde Base de Datos
                 _logger.LogInformation("Iniciando extracción desde SQL Server...");
-                var dbExtractor = scope.ServiceProvider.GetRequiredService<IDatabaseExtractor<ClienteDb>>();
 
+                var dbExtractor = scope.ServiceProvider.GetRequiredService<IDatabaseExtractor<ClienteDb>>();
                 var clientesDb = await dbExtractor.ExtractAsync();
                 await staging.SaveAsync(clientesDb, "Database", "Clientes_DB");
+
                 _logger.LogInformation("BD extraída: {Count} registros.", clientesDb.Count());
                 
+                _logger.LogInformation("Iniciando carga de dimensiones al Data Warehouse...");
 
-                _logger.LogInformation("Proceso de extracción completado exitosamente.");
+                var dwhLoadService = scope.ServiceProvider.GetRequiredService<SistemaVentas.Data.Persistence.Dwh.IDwhLoadService>();
+                await dwhLoadService.LoadDimensionsAsync();
+                _logger.LogInformation("Carga de dimensiones completada exitosamente.");
+
+                _logger.LogInformation("Proceso ETL completo (Extracción y Carga) finalizado exitosamente.");
+
             }
             catch (Exception ex)
             {
