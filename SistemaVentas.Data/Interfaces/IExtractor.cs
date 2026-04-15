@@ -5,3 +5,4 @@
         Task<IEnumerable<T>> ExtractAsync();
     }
 }
+
