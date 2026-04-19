@@ -26,9 +26,16 @@ namespace SistemaVentasETL.Worker
                 var result = await handlerService.ProcessVentasDataAsync();
 
                 if (result.IsSuccess)
-                    _logger.LogInformation("ETL completado exitosamente: {Message}", result.Message);
+                {
+                    _logger.LogInformation("================================================");
+                    _logger.LogInformation("ETL COMPLETADO EXITOSAMENTE");
+                    _logger.LogInformation("Mensaje: {Message}", result.Message);
+                    _logger.LogInformation("================================================");
+                }
                 else
-                    _logger.LogWarning("ETL finalizado con advertencia: {Message}", result.Message);
+                {
+                    _logger.LogWarning("ETL finalizado con advertencias: {Message}", result.Message);
+                }
             }
             catch (Exception ex)
             {
@@ -36,6 +43,8 @@ namespace SistemaVentasETL.Worker
             }
             finally
             {
+                _logger.LogInformation("La aplicación se cerrará en 10 segundos...");
+                await Task.Delay(10000);
                 Environment.Exit(0);
             }
         }

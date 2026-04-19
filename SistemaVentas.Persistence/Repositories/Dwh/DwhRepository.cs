@@ -56,21 +56,10 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             Console.WriteLine($"[ETL] CSV  → Órdenes: {csvOrders.Count()}, Detalles: {csvOrderDetails.Count()}");
             Console.WriteLine($"[ETL] DB   → Órdenes: {dbOrders.Count()}, Detalles: {dbOrderDetails.Count()}");
 
-            // ─── 2. TRUNCAR Fact_Ventas (ETL limpio cada vez) ─────────────
+            // ─── 2. SIN TRUNCATE (Carga Incremental) ──────────────────────
             using var dwhConn = new SqlConnection(_dwhConnectionString);
             await dwhConn.OpenAsync();
-            try { 
-                await dwhConn.ExecuteAsync("TRUNCATE TABLE Fact_Ventas"); 
-                Console.WriteLine("[ETL] Fact_Ventas truncado correctamente.");
-            } catch (Exception ex) { 
-                Console.WriteLine($"[ETL ERROR] No se pudo truncar Fact_Ventas: {ex.Message}"); 
-            }
-
-            // ─── 3. GARANTIZAR REGISTROS 'DESCONOCIDO' (ID 0) ───────────
-            // Esto evita errores de FK si un CSV/API trae un ID que no está en la DB
-            await dwhConn.ExecuteAsync("MERGE Dim_Cliente AS t USING (SELECT 0, 'Desconocido', 'N/A') AS s (ID, N, T) ON t.ID_Cliente = s.ID WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (s.ID, s.N, s.T);");
-            await dwhConn.ExecuteAsync("MERGE Dim_Producto AS t USING (SELECT 0, 'Desconocido', 'N/A', 0) AS s (ID, N, C, P) ON t.ID_Producto = s.ID WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (s.ID, s.N, s.C, s.P);");
-            await dwhConn.ExecuteAsync("MERGE Dim_Ubicacion AS t USING (SELECT 0, 'Desconocido', 'N/A', 'N/A') AS s (ID, P, R, C) ON t.ID_Ubicacion = s.ID WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (s.ID, s.P, s.R, s.C);");
+            Console.WriteLine("[ETL] Iniciando proceso incremental (Upsert).");
 
             // Dim_Cliente (DB + API enrichment)
             foreach (var cust in dbCustomers)
@@ -130,14 +119,16 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     });
             }
 
-            // Cargar sets de IDs válidos para evitar errores de FK
+            // Cargar sets de IDs válidos para validación estricta
             var validClientes = (await dwhConn.QueryAsync<int>("SELECT ID_Cliente FROM Dim_Cliente")).ToHashSet();
             var validProductos = (await dwhConn.QueryAsync<int>("SELECT ID_Producto FROM Dim_Producto")).ToHashSet();
             var validUbicaciones = (await dwhConn.QueryAsync<int>("SELECT ID_Ubicacion FROM Dim_Ubicacion")).ToHashSet();
 
+            int dbProcessed = 0, csvProcessed = 0, apiProcessed = 0;
+            int dbSkipped = 0, csvSkipped = 0, apiSkipped = 0;
+
             // ─── 4. FACT_VENTAS — DB ──────────────────────────────────────
-            int dbInserted = 0;
-            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (DB)...");
+            Console.WriteLine("[ETL] Procesando Fact_Ventas (DB)...");
             foreach (var order in dbOrders)
             {
                 try
@@ -148,29 +139,29 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     
                     int cid = order.CustomerId ?? 0;
                     int uid = customer?.CityId ?? 0;
-                    if (!validClientes.Contains(cid)) cid = 0;
-                    if (!validUbicaciones.Contains(uid)) uid = 0;
+
+                    // Validación estricta: Cliente y Ubicación deben existir
+                    if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { dbSkipped++; continue; }
 
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
                     foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
                     {
                         int pid = detail.ProductId;
-                        if (!validProductos.Contains(pid)) pid = 0;
+                        if (!validProductos.Contains(pid)) { dbSkipped++; continue; }
 
-                        await InsertFactVentas(dwhConn, order.OrderId, timeId, pid,
+                        await UpsertFactVentas(dwhConn, order.OrderId, timeId, pid,
                             cid, uid, detail.Quantity,
                             detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
-                        dbInserted++;
+                        dbProcessed++;
                     }
                 }
                 catch (Exception ex) { Console.WriteLine($"[ETL WARN] DB Order {order.OrderId} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] DB → Insertados: {dbInserted} registros.");
+            Console.WriteLine($"[ETL] DB → Procesados/Upsert: {dbProcessed}, Omitidos: {dbSkipped}");
 
             // ─── 5. FACT_VENTAS — CSV ─────────────────────────────────────
-            int csvInserted = 0;
-            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (CSV)...");
+            Console.WriteLine("[ETL] Procesando Fact_Ventas (CSV)...");
             foreach (var order in csvOrders)
             {
                 try
@@ -179,7 +170,8 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
 
                     int cid = order.CustomerID;
-                    if (!validClientes.Contains(cid)) cid = 0;
+                    // En CSV no tenemos info de ubicación, omitimos si la tabla DWH requiere integridad (y no manejamos ID 0)
+                    if (!validClientes.Contains(cid)) { csvSkipped++; continue; }
 
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
@@ -189,28 +181,21 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         foreach (var detail in details)
                         {
                             int pid = detail.ProductID;
-                            if (!validProductos.Contains(pid)) pid = 0;
+                            if (!validProductos.Contains(pid)) { csvSkipped++; continue; }
 
-                            await InsertFactVentas(dwhConn, order.OrderID, timeId, pid,
+                            await UpsertFactVentas(dwhConn, order.OrderID, timeId, pid,
                                 cid, 0, detail.Quantity,
                                 0m, detail.TotalPrice, "CSV");
-                            csvInserted++;
+                            csvProcessed++;
                         }
-                    }
-                    else
-                    {
-                        await InsertFactVentas(dwhConn, order.OrderID, timeId, 0,
-                            cid, 0, 0, 0m, 0m, "CSV");
-                        csvInserted++;
                     }
                 }
                 catch (Exception ex) { Console.WriteLine($"[ETL WARN] CSV Order {order.OrderID} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] CSV → Insertados: {csvInserted} registros.");
+            Console.WriteLine($"[ETL] CSV → Procesados/Upsert: {csvProcessed}, Omitidos: {csvSkipped}");
 
             // ─── 6. FACT_VENTAS — API ─────────────────────────────────────
-            int apiInserted = 0;
-            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (API)...");
+            Console.WriteLine("[ETL] Procesando Fact_Ventas (API)...");
             foreach (var order in apiOrders)
             {
                 try
@@ -220,7 +205,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
 
                     int cid = order.CustomerId;
-                    if (!validClientes.Contains(cid)) cid = 0;
+                    if (!validClientes.Contains(cid)) { apiSkipped++; continue; }
 
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
@@ -230,27 +215,22 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         foreach (var detail in apiDetails)
                         {
                             int pid = detail.ProductId;
-                            if (!validProductos.Contains(pid)) pid = 0;
+                            if (!validProductos.Contains(pid)) { apiSkipped++; continue; }
 
-                            await InsertFactVentas(dwhConn, order.OrderId, timeId, pid,
+                            await UpsertFactVentas(dwhConn, order.OrderId, timeId, pid,
                                 cid, 0, detail.Quantity,
                                 detail.UnitPrice, detail.TotalPrice, "API");
-                            apiInserted++;
+                            apiProcessed++;
                         }
-                    }
-                    else
-                    {
-                        await InsertFactVentas(dwhConn, order.OrderId, timeId, 0,
-                            cid, 0, 0, 0m, 0m, "API");
-                        apiInserted++;
                     }
                 }
                 catch (Exception ex) { Console.WriteLine($"[ETL WARN] API Order {order.OrderId} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] API → Insertados: {apiInserted} registros.");
+            Console.WriteLine($"[ETL] API → Procesados/Upsert: {apiProcessed}, Omitidos: {apiSkipped}");
 
             Console.WriteLine("--------------------------------------------------");
-            Console.WriteLine($"[ETL COMPLETO] Total DB: {dbInserted}, CSV: {csvInserted}, API: {apiInserted}");
+            Console.WriteLine($"[ETL COMPLETO] Total DB: {dbProcessed}, CSV: {csvProcessed}, API: {apiProcessed}");
+            Console.WriteLine($"[CALIDAD] Registros omitidos: {dbSkipped + csvSkipped + apiSkipped}");
             Console.WriteLine("--------------------------------------------------");
         }
 
@@ -277,17 +257,25 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                 });
         }
 
-        private static async Task InsertFactVentas(SqlConnection conn,
+        private static async Task UpsertFactVentas(SqlConnection conn,
             int transId, int timeId, int productId, int clienteId, int ubicacionId,
             int cantidad, decimal unitPrice, decimal totalPrice, string origen)
         {
             await conn.ExecuteAsync(@"
-                INSERT INTO Fact_Ventas
-                    (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion,
-                     Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                VALUES
-                    (@ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion,
-                     @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos)",
+                MERGE Fact_Ventas AS t
+                USING (SELECT @ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, 
+                              @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos) 
+                      AS s (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, 
+                            Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
+                ON t.ID_Transaccion = s.ID_Transaccion AND t.Origen_Datos = s.Origen_Datos AND t.ID_Producto = s.ID_Producto
+                WHEN MATCHED THEN
+                    UPDATE SET ID_Tiempo = s.ID_Tiempo, ID_Cliente = s.ID_Cliente, ID_Ubicacion = s.ID_Ubicacion,
+                               Cantidad = s.Cantidad, Precio_Unitario = s.Precio_Unitario, Total_Venta = s.Total_Venta
+                WHEN NOT MATCHED THEN
+                    INSERT (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion,
+                            Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
+                    VALUES (s.ID_Transaccion, s.ID_Tiempo, s.ID_Producto, s.ID_Cliente, s.ID_Ubicacion,
+                            s.Cantidad, s.Precio_Unitario, s.Total_Venta, s.Origen_Datos);",
                 new
                 {
                     ID_Transaccion = transId,
