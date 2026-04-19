@@ -1,4 +1,3 @@
-using System.Data;
 using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
@@ -29,162 +28,216 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
 
         public async Task LoadVentasDataAsync()
         {
-            // 1. Extract from all 3 sources
-            var apiCustomers = await _apiRepository.GetCustomersAsync();
-            var csvVentas = await _csvRepository.GetVentasAsync();
-            IEnumerable<Customer> dbCustomers;
-            IEnumerable<Order> dbOrders;
+            // ─── 1. EXTRACT ────────────────────────────────────────────────
+            var apiCustomers    = await _apiRepository.GetCustomersAsync();
+            var apiOrders       = await _apiRepository.GetOrdersAsync();
+            var apiOrderDetails = await _apiRepository.GetOrderDetailsAsync();
+
+            var csvOrders       = await _csvRepository.GetVentasAsync();
+            var csvOrderDetails = await _csvRepository.GetOrderDetailsAsync();
+
+            IEnumerable<Customer>    dbCustomers;
+            IEnumerable<Order>       dbOrders;
             IEnumerable<OrderDetail> dbOrderDetails;
-            IEnumerable<Product> dbProducts;
-            IEnumerable<City> dbCities;
-            IEnumerable<Country> dbCountries;
+            IEnumerable<Product>     dbProducts;
+            IEnumerable<City>        dbCities;
+            IEnumerable<Country>     dbCountries;
 
             using var ventasConn = new SqlConnection(_ventasConnectionString);
-            dbCustomers = await ventasConn.QueryAsync<Customer>("SELECT * FROM Customer");
-            dbOrders    = await ventasConn.QueryAsync<Order>("SELECT * FROM [Order]");
-            dbOrderDetails = await ventasConn.QueryAsync<OrderDetail>("SELECT * FROM Order_Detail");
-            dbProducts  = await ventasConn.QueryAsync<Product>("SELECT * FROM Product");
-            dbCities    = await ventasConn.QueryAsync<City>("SELECT * FROM City");
-            dbCountries = await ventasConn.QueryAsync<Country>("SELECT * FROM Country");
+            dbCustomers    = await ventasConn.QueryAsync<Customer>   ("SELECT * FROM Customer");
+            dbOrders       = await ventasConn.QueryAsync<Order>      ("SELECT * FROM [Order]");
+            dbOrderDetails = await ventasConn.QueryAsync<OrderDetail> ("SELECT * FROM Order_Detail");
+            dbProducts     = await ventasConn.QueryAsync<Product>    ("SELECT * FROM Product");
+            dbCities       = await ventasConn.QueryAsync<City>       ("SELECT * FROM City");
+            dbCountries    = await ventasConn.QueryAsync<Country>    ("SELECT * FROM Country");
 
-            // 2. Load into DWH using Dapper
+            // ─── DIAGNÓSTICO: conteo por fuente ───────────────────────────
+            Console.WriteLine($"[ETL] API  → Órdenes: {apiOrders.Count()}, Detalles: {apiOrderDetails.Count()}");
+            Console.WriteLine($"[ETL] CSV  → Órdenes: {csvOrders.Count()}, Detalles: {csvOrderDetails.Count()}");
+            Console.WriteLine($"[ETL] DB   → Órdenes: {dbOrders.Count()}, Detalles: {dbOrderDetails.Count()}");
+
+            // ─── 2. TRUNCAR Fact_Ventas (ETL limpio cada vez) ─────────────
             using var dwhConn = new SqlConnection(_dwhConnectionString);
             await dwhConn.OpenAsync();
+            await dwhConn.ExecuteAsync("TRUNCATE TABLE Fact_Ventas");
 
-            // 2a. Dim_Cliente - from DB + API (merge: API is enrichment, DB is source of truth)
+            // Dim_Cliente (DB + API enrichment)
             foreach (var cust in dbCustomers)
             {
                 var apiMatch = apiCustomers.FirstOrDefault(a => a.Id == cust.CustomerId);
-                var sql = @"MERGE Dim_Cliente AS target
-                    USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS source (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
-                    ON target.ID_Cliente = source.ID_Cliente
-                    WHEN MATCHED THEN UPDATE SET Nombre_Cliente = source.Nombre_Cliente, Tipo_Cliente = source.Tipo_Cliente
-                    WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (source.ID_Cliente, source.Nombre_Cliente, source.Tipo_Cliente);";
-                await dwhConn.ExecuteAsync(sql, new
-                {
-                    ID_Cliente = cust.CustomerId,
-                    Nombre_Cliente = $"{cust.FirstName} {cust.LastName}",
-                    Tipo_Cliente = apiMatch?.CustomerType ?? "Regular"
-                });
+                await dwhConn.ExecuteAsync(@"
+                    MERGE Dim_Cliente AS t
+                    USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
+                    ON t.ID_Cliente = s.ID_Cliente
+                    WHEN MATCHED     THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
+                    WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
+                                          VALUES (s.ID_Cliente, s.Nombre_Cliente, s.Tipo_Cliente);",
+                    new
+                    {
+                        ID_Cliente     = cust.CustomerId,
+                        Nombre_Cliente = $"{cust.FirstName} {cust.LastName}",
+                        Tipo_Cliente   = apiMatch?.CustomerType ?? "Regular"
+                    });
             }
 
-            // 2b. Dim_Producto
+            // Dim_Producto
             foreach (var prod in dbProducts)
             {
-                var sql = @"MERGE Dim_Producto AS target
-                    USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS source (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
-                    ON target.ID_Producto = source.ID_Producto
-                    WHEN MATCHED THEN UPDATE SET Nombre_Producto = source.Nombre_Producto, Categoria = source.Categoria, Precio_Base = source.Precio_Base
-                    WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (source.ID_Producto, source.Nombre_Producto, source.Categoria, source.Precio_Base);";
-                await dwhConn.ExecuteAsync(sql, new
-                {
-                    ID_Producto = prod.ProductId,
-                    Nombre_Producto = prod.ProductName,
-                    Categoria = prod.CategoryId.ToString(),
-                    Precio_Base = prod.Price
-                });
+                await dwhConn.ExecuteAsync(@"
+                    MERGE Dim_Producto AS t
+                    USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
+                    ON t.ID_Producto = s.ID_Producto
+                    WHEN MATCHED     THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
+                    WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
+                                          VALUES (s.ID_Producto, s.Nombre_Producto, s.Categoria, s.Precio_Base);",
+                    new
+                    {
+                        ID_Producto    = prod.ProductId,
+                        Nombre_Producto = prod.ProductName,
+                        Categoria      = prod.CategoryId.ToString(),
+                        Precio_Base    = prod.Price
+                    });
             }
 
-            // 2c. Dim_Ubicacion (from DB City/Country)
+            // Dim_Ubicacion
             foreach (var city in dbCities)
             {
                 var country = dbCountries.FirstOrDefault(c => c.CountryId == city.CountryId);
-                var sql = @"MERGE Dim_Ubicacion AS target
-                    USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS source (ID_Ubicacion, Pais, Region, Ciudad)
-                    ON target.ID_Ubicacion = source.ID_Ubicacion
-                    WHEN MATCHED THEN UPDATE SET Pais = source.Pais, Region = source.Region, Ciudad = source.Ciudad
-                    WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (source.ID_Ubicacion, source.Pais, source.Region, source.Ciudad);";
-                await dwhConn.ExecuteAsync(sql, new
-                {
-                    ID_Ubicacion = city.CityId,
-                    Pais = country?.CountryName ?? "Desconocido",
-                    Region = country?.CountryName ?? "Desconocido",
-                    Ciudad = city.CityName
-                });
+                await dwhConn.ExecuteAsync(@"
+                    MERGE Dim_Ubicacion AS t
+                    USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad)
+                    ON t.ID_Ubicacion = s.ID_Ubicacion
+                    WHEN MATCHED     THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
+                    WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad)
+                                          VALUES (s.ID_Ubicacion, s.Pais, s.Region, s.Ciudad);",
+                    new
+                    {
+                        ID_Ubicacion = city.CityId,
+                        Pais         = country?.CountryName ?? "Desconocido",
+                        Region       = country?.CountryName ?? "Desconocido",
+                        Ciudad       = city.CityName
+                    });
             }
 
-            // 2d. Dim_Tiempo + Fact_Ventas from Orders+OrderDetails
+            // ─── 3. FACT_VENTAS — DB ──────────────────────────────────────
             foreach (var order in dbOrders)
             {
-                var orderDate = order.OrderDate ?? DateTime.Today;
-                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                var orderDate    = order.OrderDate ?? DateTime.Today;
+                int timeId       = int.Parse(orderDate.ToString("yyyyMMdd"));
+                var customer     = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
+                var ubicacionId  = customer?.CityId ?? 0;
 
-                // Dim_Tiempo
-                var timeSql = @"MERGE Dim_Tiempo AS target
-                    USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia) AS source (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
-                    ON target.ID_Tiempo = source.ID_Tiempo
-                    WHEN NOT MATCHED THEN INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia) VALUES (source.ID_Tiempo, source.Fecha, source.Anio, source.Trimestre, source.Mes, source.Nombre_Mes, source.Dia);";
-                await dwhConn.ExecuteAsync(timeSql, new
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
                 {
-                    ID_Tiempo = timeId,
-                    Fecha = orderDate.Date,
-                    Anio = orderDate.Year,
-                    Trimestre = (orderDate.Month - 1) / 3 + 1,
-                    Mes = orderDate.Month,
-                    Nombre_Mes = orderDate.ToString("MMMM"),
-                    Dia = orderDate.Day
-                });
-
-                // Fact_Ventas (one row per order detail)
-                var details = dbOrderDetails.Where(d => d.OrderId == order.OrderId);
-                var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
-                var ubicacionId = customer != null ? (customer.CityId ?? 0) : 0;
-
-                foreach (var detail in details)
-                {
-                    var factSql = @"INSERT INTO Fact_Ventas (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                        VALUES (@ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos)";
-                    await dwhConn.ExecuteAsync(factSql, new
-                    {
-                        ID_Transaccion = order.OrderId,
-                        ID_Tiempo = timeId,
-                        ID_Producto = detail.ProductId,
-                        ID_Cliente = order.CustomerId,
-                        ID_Ubicacion = ubicacionId,
-                        Cantidad = detail.Quantity,
-                        Precio_Unitario = detail.UnitPrice,
-                        Total_Venta = detail.TotalPrice,
-                        Origen_Datos = "DB"
-                    });
+                    await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
+                        order.CustomerId ?? 0, ubicacionId, detail.Quantity,
+                        detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
                 }
             }
 
-            // 2e. Fact_Ventas from CSV (additional sales not in DB)
-            foreach (var venta in csvVentas)
+            // ─── 4. FACT_VENTAS — CSV ─────────────────────────────────────
+            foreach (var order in csvOrders)
             {
-                var orderDate = venta.OrderDate;
+                var orderDate   = order.OrderDate;
+                int timeId      = int.Parse(orderDate.ToString("yyyyMMdd"));
+
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                var details = csvOrderDetails.Where(d => d.OrderID == order.OrderID).ToList();
+                if (details.Count > 0)
+                {
+                    // Insert one row per detail line
+                    foreach (var detail in details)
+                    {
+                        await InsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID,
+                            order.CustomerID, 0, detail.Quantity,
+                            0m, detail.TotalPrice, "CSV");
+                    }
+                }
+                else
+                {
+                    // No matching details — insert the order itself as a summary row
+                    await InsertFactVentas(dwhConn, order.OrderID, timeId, 0,
+                        order.CustomerID, 0, 0, 0m, 0m, "CSV");
+                }
+            }
+
+            // ─── 5. FACT_VENTAS — API ─────────────────────────────────────
+            foreach (var order in apiOrders)
+            {
+                DateTime.TryParse(order.OrderDate, out DateTime orderDate);
+                if (orderDate == default) orderDate = DateTime.Today;
                 int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
 
-                var timeSql = @"MERGE Dim_Tiempo AS target
-                    USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia) AS source (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
-                    ON target.ID_Tiempo = source.ID_Tiempo
-                    WHEN NOT MATCHED THEN INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia) VALUES (source.ID_Tiempo, source.Fecha, source.Anio, source.Trimestre, source.Mes, source.Nombre_Mes, source.Dia);";
-                await dwhConn.ExecuteAsync(timeSql, new
-                {
-                    ID_Tiempo = timeId,
-                    Fecha = orderDate.Date,
-                    Anio = orderDate.Year,
-                    Trimestre = (orderDate.Month - 1) / 3 + 1,
-                    Mes = orderDate.Month,
-                    Nombre_Mes = orderDate.ToString("MMMM"),
-                    Dia = orderDate.Day
-                });
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
 
-                var factSql = @"INSERT INTO Fact_Ventas (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                    VALUES (@ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos)";
-                await dwhConn.ExecuteAsync(factSql, new
+                var apiDetails = apiOrderDetails.Where(d => d.OrderId == order.OrderId).ToList();
+                if (apiDetails.Count > 0)
                 {
-                    ID_Transaccion = venta.OrderID,
-                    ID_Tiempo = timeId,
-                    ID_Producto = 0,             // OrderCsv does not carry ProductID; join via order_details if needed
-                    ID_Cliente = venta.CustomerID,
-                    ID_Ubicacion = 0,            // No city info in CSV
-                    Cantidad = 0,
-                    Precio_Unitario = 0m,
-                    Total_Venta = 0m,
-                    Origen_Datos = "CSV"
-                });
+                    foreach (var detail in apiDetails)
+                    {
+                        await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
+                            order.CustomerId, 0, detail.Quantity,
+                            detail.UnitPrice, detail.TotalPrice, "API");
+                    }
+                }
+                else
+                {
+                    // No details from API — insert the order as a summary row
+                    await InsertFactVentas(dwhConn, order.OrderId, timeId, 0,
+                        order.CustomerId, 0, 0, 0m, 0m, "API");
+                }
             }
+        }
+
+        // ─── Helpers ──────────────────────────────────────────────────────
+        private static async Task MergeDimTiempo(SqlConnection conn, int timeId, DateTime date)
+        {
+            await conn.ExecuteAsync(@"
+                MERGE Dim_Tiempo AS t
+                USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia)
+                      AS s (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
+                ON t.ID_Tiempo = s.ID_Tiempo
+                WHEN NOT MATCHED THEN
+                    INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
+                    VALUES (s.ID_Tiempo, s.Fecha, s.Anio, s.Trimestre, s.Mes, s.Nombre_Mes, s.Dia);",
+                new
+                {
+                    ID_Tiempo  = timeId,
+                    Fecha      = date.Date,
+                    Anio       = date.Year,
+                    Trimestre  = (date.Month - 1) / 3 + 1,
+                    Mes        = date.Month,
+                    Nombre_Mes = date.ToString("MMMM"),
+                    Dia        = date.Day
+                });
+        }
+
+        private static async Task InsertFactVentas(SqlConnection conn,
+            int transId, int timeId, int productId, int clienteId, int ubicacionId,
+            int cantidad, decimal unitPrice, decimal totalPrice, string origen)
+        {
+            await conn.ExecuteAsync(@"
+                INSERT INTO Fact_Ventas
+                    (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion,
+                     Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
+                VALUES
+                    (@ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion,
+                     @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos)",
+                new
+                {
+                    ID_Transaccion = transId,
+                    ID_Tiempo      = timeId,
+                    ID_Producto    = productId,
+                    ID_Cliente     = clienteId,
+                    ID_Ubicacion   = ubicacionId,
+                    Cantidad       = cantidad,
+                    Precio_Unitario = unitPrice,
+                    Total_Venta    = totalPrice,
+                    Origen_Datos   = origen
+                });
         }
     }
 }

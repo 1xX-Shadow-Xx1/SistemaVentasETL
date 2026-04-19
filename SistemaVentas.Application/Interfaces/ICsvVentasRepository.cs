@@ -5,5 +5,6 @@ namespace SistemaVentas.Application.Interfaces
     public interface ICsvVentasRepository
     {
         Task<IEnumerable<OrderCsv>> GetVentasAsync();
+        Task<IEnumerable<OrderDetailCsv>> GetOrderDetailsAsync();
     }
 }

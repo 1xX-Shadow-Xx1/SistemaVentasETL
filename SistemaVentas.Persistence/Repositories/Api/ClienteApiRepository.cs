@@ -18,15 +18,20 @@ namespace SistemaVentas.Persistence.Repositories.Api
 
         public async Task<IEnumerable<CustomerAPIDto>> GetCustomersAsync()
         {
-            try
-            {
-                var result = await _httpClient.GetFromJsonAsync<IEnumerable<CustomerAPIDto>>("/api/users");
-                return result ?? Enumerable.Empty<CustomerAPIDto>();
-            }
-            catch
-            {
-                return Enumerable.Empty<CustomerAPIDto>();
-            }
+            try { return await _httpClient.GetFromJsonAsync<IEnumerable<CustomerAPIDto>>("/api/users") ?? []; }
+            catch { return []; }
+        }
+
+        public async Task<IEnumerable<OrderAPIDto>> GetOrdersAsync()
+        {
+            try { return await _httpClient.GetFromJsonAsync<IEnumerable<OrderAPIDto>>("/api/orders") ?? []; }
+            catch { return []; }
+        }
+
+        public async Task<IEnumerable<OrderDetailAPIDto>> GetOrderDetailsAsync()
+        {
+            try { return await _httpClient.GetFromJsonAsync<IEnumerable<OrderDetailAPIDto>>("/api/order-details") ?? []; }
+            catch { return []; }
         }
     }
 }

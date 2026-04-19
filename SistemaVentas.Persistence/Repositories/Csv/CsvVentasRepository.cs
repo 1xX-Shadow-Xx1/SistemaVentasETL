@@ -16,13 +16,10 @@ namespace SistemaVentas.Persistence.Repositories.Csv
         public async Task<IEnumerable<OrderCsv>> GetVentasAsync()
         {
             var path = _configuration["CsvPaths:Orders"];
-            if (string.IsNullOrEmpty(path) || !File.Exists(path))
-                return Enumerable.Empty<OrderCsv>();
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return [];
 
             var lines = await File.ReadAllLinesAsync(path);
             var result = new List<OrderCsv>();
-
-            // CSV Columns: OrderID,CustomerID,OrderDate,Status
             for (int i = 1; i < lines.Length; i++)
             {
                 var parts = lines[i].Split(',');
@@ -30,14 +27,32 @@ namespace SistemaVentas.Persistence.Repositories.Csv
                 {
                     int.TryParse(parts[1], out int customerId);
                     DateTime.TryParse(parts[2], out DateTime orderDate);
+                    result.Add(new OrderCsv { OrderID = orderId, CustomerID = customerId, OrderDate = orderDate, Status = parts[3].Trim() });
+                }
+            }
+            return result;
+        }
 
-                    result.Add(new OrderCsv
-                    {
-                        OrderID = orderId,
-                        CustomerID = customerId,
-                        OrderDate = orderDate,
-                        Status = parts[3].Trim()
-                    });
+        public async Task<IEnumerable<OrderDetailCsv>> GetOrderDetailsAsync()
+        {
+            var path = _configuration["CsvPaths:OrderDetails"];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return [];
+
+            var lines = await File.ReadAllLinesAsync(path);
+            var result = new List<OrderDetailCsv>();
+            // CSV Columns: OrderID,ProductID,Quantity,UnitPrice,TotalPrice  (UnitPrice may not exist in entity but we read it anyway)
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var parts = lines[i].Split(',');
+                if (parts.Length >= 3 && int.TryParse(parts[0], out int orderId))
+                {
+                    int.TryParse(parts[1], out int productId);
+                    int.TryParse(parts[2], out int quantity);
+                    decimal.TryParse(parts.Length > 4 ? parts[4] : (parts.Length > 3 ? parts[3] : "0"),
+                        System.Globalization.NumberStyles.Any,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out decimal totalPrice);
+                    result.Add(new OrderDetailCsv { OrderID = orderId, ProductID = productId, Quantity = quantity, TotalPrice = totalPrice });
                 }
             }
             return result;

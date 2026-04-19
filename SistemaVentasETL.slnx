@@ -3,5 +3,5 @@
   <Project Path="SistemaVentas.Domain/SistemaVentas.Domain.csproj" />
   <Project Path="SistemaVentas.Application/SistemaVentas.Application.csproj" />
   <Project Path="SistemaVentas.Persistence/SistemaVentas.Persistence.csproj" />
-  <Project Path="SistemaVentasETL.Worker/SistemaVentasETL.WkService.csproj" />
+  <Project Path="SistemaVentasETL.Worker/SistemaVentasETL.Worker.csproj" />
 </Solution>
