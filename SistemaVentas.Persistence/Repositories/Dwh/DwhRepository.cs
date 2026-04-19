@@ -66,6 +66,12 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                 Console.WriteLine($"[ETL ERROR] No se pudo truncar Fact_Ventas: {ex.Message}"); 
             }
 
+            // ─── 3. GARANTIZAR REGISTROS 'DESCONOCIDO' (ID 0) ───────────
+            // Esto evita errores de FK si un CSV/API trae un ID que no está en la DB
+            await dwhConn.ExecuteAsync("MERGE Dim_Cliente AS t USING (SELECT 0, 'Desconocido', 'N/A') AS s (ID, N, T) ON t.ID_Cliente = s.ID WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (s.ID, s.N, s.T);");
+            await dwhConn.ExecuteAsync("MERGE Dim_Producto AS t USING (SELECT 0, 'Desconocido', 'N/A', 0) AS s (ID, N, C, P) ON t.ID_Producto = s.ID WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (s.ID, s.N, s.C, s.P);");
+            await dwhConn.ExecuteAsync("MERGE Dim_Ubicacion AS t USING (SELECT 0, 'Desconocido', 'N/A', 'N/A') AS s (ID, P, R, C) ON t.ID_Ubicacion = s.ID WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (s.ID, s.P, s.R, s.C);");
+
             // Dim_Cliente (DB + API enrichment)
             foreach (var cust in dbCustomers)
             {
@@ -124,6 +130,11 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     });
             }
 
+            // Cargar sets de IDs válidos para evitar errores de FK
+            var validClientes = (await dwhConn.QueryAsync<int>("SELECT ID_Cliente FROM Dim_Cliente")).ToHashSet();
+            var validProductos = (await dwhConn.QueryAsync<int>("SELECT ID_Producto FROM Dim_Producto")).ToHashSet();
+            var validUbicaciones = (await dwhConn.QueryAsync<int>("SELECT ID_Ubicacion FROM Dim_Ubicacion")).ToHashSet();
+
             // ─── 4. FACT_VENTAS — DB ──────────────────────────────────────
             int dbInserted = 0;
             Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (DB)...");
@@ -134,14 +145,21 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     var orderDate = order.OrderDate ?? DateTime.Today;
                     int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
                     var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
-                    var ubicacionId = customer?.CityId ?? 0;
+                    
+                    int cid = order.CustomerId ?? 0;
+                    int uid = customer?.CityId ?? 0;
+                    if (!validClientes.Contains(cid)) cid = 0;
+                    if (!validUbicaciones.Contains(uid)) uid = 0;
 
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
                     foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
                     {
-                        await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
-                            order.CustomerId ?? 0, ubicacionId, detail.Quantity,
+                        int pid = detail.ProductId;
+                        if (!validProductos.Contains(pid)) pid = 0;
+
+                        await InsertFactVentas(dwhConn, order.OrderId, timeId, pid,
+                            cid, uid, detail.Quantity,
                             detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
                         dbInserted++;
                     }
@@ -160,6 +178,9 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     var orderDate = order.OrderDate;
                     int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
 
+                    int cid = order.CustomerID;
+                    if (!validClientes.Contains(cid)) cid = 0;
+
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
                     var details = csvOrderDetails.Where(d => d.OrderID == order.OrderID).ToList();
@@ -167,8 +188,11 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     {
                         foreach (var detail in details)
                         {
-                            await InsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID,
-                                order.CustomerID, 0, detail.Quantity,
+                            int pid = detail.ProductID;
+                            if (!validProductos.Contains(pid)) pid = 0;
+
+                            await InsertFactVentas(dwhConn, order.OrderID, timeId, pid,
+                                cid, 0, detail.Quantity,
                                 0m, detail.TotalPrice, "CSV");
                             csvInserted++;
                         }
@@ -176,7 +200,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     else
                     {
                         await InsertFactVentas(dwhConn, order.OrderID, timeId, 0,
-                            order.CustomerID, 0, 0, 0m, 0m, "CSV");
+                            cid, 0, 0, 0m, 0m, "CSV");
                         csvInserted++;
                     }
                 }
@@ -195,6 +219,9 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     if (orderDate == default) orderDate = DateTime.Today;
                     int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
 
+                    int cid = order.CustomerId;
+                    if (!validClientes.Contains(cid)) cid = 0;
+
                     await MergeDimTiempo(dwhConn, timeId, orderDate);
 
                     var apiDetails = apiOrderDetails.Where(d => d.OrderId == order.OrderId).ToList();
@@ -202,8 +229,11 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     {
                         foreach (var detail in apiDetails)
                         {
-                            await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
-                                order.CustomerId, 0, detail.Quantity,
+                            int pid = detail.ProductId;
+                            if (!validProductos.Contains(pid)) pid = 0;
+
+                            await InsertFactVentas(dwhConn, order.OrderId, timeId, pid,
+                                cid, 0, detail.Quantity,
                                 detail.UnitPrice, detail.TotalPrice, "API");
                             apiInserted++;
                         }
@@ -211,7 +241,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     else
                     {
                         await InsertFactVentas(dwhConn, order.OrderId, timeId, 0,
-                            order.CustomerId, 0, 0, 0m, 0m, "API");
+                            cid, 0, 0, 0m, 0m, "API");
                         apiInserted++;
                     }
                 }
