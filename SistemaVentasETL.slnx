@@ -1,5 +1,7 @@
 <Solution>
   <Project Path="Api/Api.csproj" Id="404ab404-f760-4ccc-9a74-21e52d555bb5" />
-  <Project Path="SistemaVentas.Data/SistemaVentas.Data.csproj" />
+  <Project Path="SistemaVentas.Domain/SistemaVentas.Domain.csproj" />
+  <Project Path="SistemaVentas.Application/SistemaVentas.Application.csproj" />
+  <Project Path="SistemaVentas.Persistence/SistemaVentas.Persistence.csproj" />
   <Project Path="SistemaVentasETL.Worker/SistemaVentasETL.WkService.csproj" />
 </Solution>
