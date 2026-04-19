@@ -1,14 +1,63 @@
-﻿using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
-using SistemaVentas.Data.Entities.Db;
+using SistemaVentas.Data.Models;
 using SistemaVentas.Data.Interfaces;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace SistemaVentas.Data.Persistence.Db
 {
-    public class ClienteDbExtractor : IDatabaseExtractor<ClienteDb>
+    // Contexto de base de datos para la extracción desde el sistema relacional (OLTP)
+    public class VentasDbContext : DbContext
+    {
+        public VentasDbContext(DbContextOptions<VentasDbContext> options) : base(options) { }
+
+        public DbSet<Category> Categories { get; set; }
+        public DbSet<City> Cities { get; set; }
+        public DbSet<Country> Countries { get; set; }
+        public DbSet<Customer> Customers { get; set; }
+        public DbSet<Order> Orders { get; set; }
+        public DbSet<OrderDetail> OrderDetails { get; set; }
+        public DbSet<Product> Products { get; set; }
+        public DbSet<Status> Statuses { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<Category>().ToTable("Category");
+            modelBuilder.Entity<City>().ToTable("City");
+            modelBuilder.Entity<Country>().ToTable("Country");
+            modelBuilder.Entity<Customer>().ToTable("Customer");
+            modelBuilder.Entity<Order>().ToTable("Order");
+            modelBuilder.Entity<Product>().ToTable("Product");
+            modelBuilder.Entity<Status>().ToTable("Status");
+            
+            modelBuilder.Entity<OrderDetail>()
+                .ToTable("Order_Detail")
+                .HasKey(od => new { od.OrderId, od.ProductId });
+        }
+    }
+
+    // Estructura DTO para retornar todas las tablas juntas en un solo objeto iterable
+    public class VentasDbData
+    {
+        public List<Category> Categories { get; set; } = new();
+        public List<City> Cities { get; set; } = new();
+        public List<Country> Countries { get; set; } = new();
+        public List<Customer> Customers { get; set; } = new();
+        public List<Order> Orders { get; set; } = new();
+        public List<OrderDetail> OrderDetails { get; set; } = new();
+        public List<Product> Products { get; set; } = new();
+        public List<Status> Statuses { get; set; } = new();
+    }
+
+    public class ClienteDbExtractor : IDatabaseExtractor<VentasDbData>
     {
         private readonly IConfiguration _config;
         private readonly string _connectionString;
+
+        public string SourceType => "Database";
+        public string EntityName => nameof(VentasDbData);
+        public string SourceName => "VentasDB";
 
         public ClienteDbExtractor(IConfiguration config)
         {
@@ -16,28 +65,27 @@ namespace SistemaVentas.Data.Persistence.Db
             _connectionString = _config.GetConnectionString("VentasDB") ?? "";
         }
 
-        public async Task<IEnumerable<ClienteDb>> ExtractAsync()
+        public async Task<IEnumerable<VentasDbData>> ExtractAsync()
         {
-            var clientes = new List<ClienteDb>();
-            using var connection = new SqlConnection(_connectionString);
+            var optionsBuilder = new DbContextOptionsBuilder<VentasDbContext>();
+            optionsBuilder.UseSqlServer(_connectionString);
 
-            var query = "SELECT ID_Cliente, Nombre_Cliente, Tipo_Cliente FROM Dim_Cliente";
+            using var context = new VentasDbContext(optionsBuilder.Options);
 
-            using var command = new SqlCommand(query, connection);
-            await connection.OpenAsync();
-            using var reader = await command.ExecuteReaderAsync();
-
-            while (await reader.ReadAsync())
+            var dbData = new VentasDbData
             {
-                clientes.Add(new ClienteDb
-                {
-                    ID_Cliente = reader.GetInt32(0),
-                    Nombre_Cliente = reader.GetString(1),
-                    Tipo_Cliente = reader.GetString(2)
-                });
-            }
-            return clientes;
-        }
+                Categories = await context.Categories.ToListAsync(),
+                Cities = await context.Cities.ToListAsync(),
+                Countries = await context.Countries.ToListAsync(),
+                Customers = await context.Customers.ToListAsync(),
+                Orders = await context.Orders.ToListAsync(),
+                OrderDetails = await context.OrderDetails.ToListAsync(),
+                Products = await context.Products.ToListAsync(),
+                Statuses = await context.Statuses.ToListAsync()
+            };
 
+            // Retornamos un enumerable de 1 solo elemento que contiene todas las listas extraídas
+            return new List<VentasDbData> { dbData };
+        }
     }
 }

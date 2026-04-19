@@ -36,7 +36,7 @@ namespace SistemaVentasETL.Worker
 
                 // Extracción desde API REST
                 _logger.LogInformation("Iniciando extracción desde API REST...");
-                var apiExtractor = scope.ServiceProvider.GetRequiredService<IApiExtractor<ClientApi>>();
+                var apiExtractor = scope.ServiceProvider.GetRequiredService<IApiExtractor<CustomerAPIDto>>();
 
                 var clientesApi = await apiExtractor.ExtractAsync();
                 await staging.SaveAsync(clientesApi, "API", "Clientes_API");

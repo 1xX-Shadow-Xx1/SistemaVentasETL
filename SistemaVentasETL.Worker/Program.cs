@@ -17,7 +17,7 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSingleton<StagingService>();
 
 // 2. Extractor API REST (Configura HttpClient automáticamente)
-builder.Services.AddHttpClient<IApiExtractor<ClientApi>, ClienteApiExtractor>();
+builder.Services.AddHttpClient<IApiExtractor<CustomerAPIDto>, ClienteApiExtractor>();
 
 // 3. Extractores de Archivos y Base de Datos
 builder.Services.AddTransient<ICsvExtractor<VentaCsv>, VentaCsvExtractor>();

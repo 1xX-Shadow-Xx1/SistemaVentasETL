@@ -1,15 +1,19 @@
-﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration;
 using SistemaVentas.Data.Entities.Api;
 using SistemaVentas.Data.Interfaces;
 
 namespace SistemaVentas.Data.Persistence.Api
 {
-    public class ClienteApiExtractor : IApiExtractor<ClientApi>
+    public class ClienteApiExtractor : IApiExtractor<CustomerAPIDto>
     {
         private readonly HttpClient _httpClient;
         private readonly IConfiguration _config;
 
         public int PageSize => int.Parse(_config["ApiSettings:PageSize"] ?? "100");
+
+        public string SourceType => "API";
+        public string EntityName => nameof(CustomerAPIDto);
+        public string SourceName => _config["ApiSettings:BaseUrl"] ?? "Unknown URL";
 
         public ClienteApiExtractor(HttpClient httpClient, IConfiguration config)
         {
@@ -17,7 +21,7 @@ namespace SistemaVentas.Data.Persistence.Api
             _config = config;
         }
 
-        public async Task<IEnumerable<ClientApi>> ExtractAsync()
+        public async Task<IEnumerable<CustomerAPIDto>> ExtractAsync()
         {
             var baseUrl = _config["ApiSettings:BaseUrl"];
             var url = $"{baseUrl}/users";
@@ -25,11 +29,11 @@ namespace SistemaVentas.Data.Persistence.Api
             var response = await _httpClient.GetAsync(url);
 
             if (!response.IsSuccessStatusCode)
-                return new List<ClientApi>();
+                return new List<CustomerAPIDto>();
 
-            return new List<ClientApi>
+            return new List<CustomerAPIDto>
             {
-                new ClientApi { Id = 999, Name = "Cliente Desde API", CustomerType = "Online" }
+                new CustomerAPIDto { Id = 999, Name = "Cliente Desde API", CustomerType = "Online" }
             };
         }
     }

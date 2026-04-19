@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration;
 using System.Text.Json;
 using SistemaVentas.Data.Persistence.Context;
 using SistemaVentas.Data.Entities.Dwh.Dimensions;
@@ -26,8 +26,6 @@ namespace SistemaVentas.Data.Persistence.Dwh
             Console.WriteLine("Iniciando lectura de Staging y carga a SQL Server...");
 
             await LoadClientesAsync();
-
-            // NOTA: Aquí puedes agregar llamadas a LoadProductosAsync(), LoadTiempoAsync(), etc., siguiendo la misma lógica.
 
             await _context.SaveChangesAsync();
 

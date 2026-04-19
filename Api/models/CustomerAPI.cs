@@ -1,6 +1,6 @@
-﻿namespace SistemaVentas.Data.Entities.Api
+namespace Api.Models
 {
-    public class ClientApi
+    public class CustomerAPI
     {
         public int Id { get; set; }
         public string Name { get; set; } = string.Empty;
