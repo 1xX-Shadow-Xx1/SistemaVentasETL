@@ -1,35 +1,30 @@
-using Microsoft.EntityFrameworkCore;
-using SistemaVentas.Data.Entities.Api;
-using SistemaVentas.Data.Entities.Csv;
-using SistemaVentas.Data.Entities.Db;
-using SistemaVentas.Data.Interfaces;
-using SistemaVentas.Data.Persistence.Api;
-using SistemaVentas.Data.Persistence.Context;
-using SistemaVentas.Data.Persistence.Csv;
-using SistemaVentas.Data.Persistence.Db;
-using SistemaVentas.Data.Persistence.Dwh;
-using SistemaVentas.Data.Persistence.Staging;
+using SistemaVentas.Application.Interfaces;
+using SistemaVentas.Application.Services;
+using SistemaVentas.Persistence.Repositories.Api;
+using SistemaVentas.Persistence.Repositories.Csv;
+using SistemaVentas.Persistence.Repositories.Dwh;
 using SistemaVentasETL.Worker;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// 1. Servicio de guardado temporal (Staging)
-builder.Services.AddSingleton<StagingService>();
+// 1. HttpClient for the mock API extractor
+builder.Services.AddHttpClient<IClienteApiRepository, ClienteApiRepository>(client =>
+{
+    var baseUrl = builder.Configuration["ApiSettings:BaseUrl"] ?? "http://localhost:5000";
+    client.BaseAddress = new Uri(baseUrl);
+});
 
-// 2. Extractor API REST (Configura HttpClient automáticamente)
-builder.Services.AddHttpClient<IApiExtractor<CustomerAPIDto>, ClienteApiExtractor>();
+// 2. CSV repository (reads from external path defined in appsettings)
+builder.Services.AddTransient<ICsvVentasRepository, CsvVentasRepository>();
 
-// 3. Extractores de Archivos y Base de Datos
-builder.Services.AddTransient<ICsvExtractor<VentaCsv>, VentaCsvExtractor>();
-builder.Services.AddTransient<IDatabaseExtractor<ClienteDb>, ClienteDbExtractor>();
+// 3. DWH Repository with Dapper
+builder.Services.AddTransient<IDwhRepository, DwhRepository>();
 
-builder.Services.AddDbContext<VentasDwhContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("VentasDB")));
+// 4. Application Service (orchestrator)
+builder.Services.AddTransient<IVentasHandlerService, VentasHandlerService>();
 
-builder.Services.AddTransient<IDwhLoadService, DwhLoadService>();
-
-// 4. El motor principal
-builder.Services.AddHostedService<Worker>();    
+// 5. Background Worker
+builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();
 host.Run();

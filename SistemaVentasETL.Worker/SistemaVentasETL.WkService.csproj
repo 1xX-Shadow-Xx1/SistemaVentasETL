@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\SistemaVentas.Data\SistemaVentas.Data.csproj" />
+    <ProjectReference Include="..\SistemaVentas.Application\SistemaVentas.Application.csproj" />
+    <ProjectReference Include="..\SistemaVentas.Persistence\SistemaVentas.Persistence.csproj" />
   </ItemGroup>
 </Project>

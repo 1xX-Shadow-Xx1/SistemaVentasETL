@@ -1,8 +1,4 @@
-using SistemaVentas.Data.Entities.Api;
-using SistemaVentas.Data.Entities.Csv;
-using SistemaVentas.Data.Entities.Db;
-using SistemaVentas.Data.Interfaces;
-using SistemaVentas.Data.Persistence.Staging;
+using SistemaVentas.Application.Interfaces;
 
 namespace SistemaVentasETL.Worker
 {
@@ -19,50 +15,24 @@ namespace SistemaVentasETL.Worker
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Proceso ETL (Extracción) iniciado a las: {Time}", DateTimeOffset.Now);
+            _logger.LogInformation("Proceso ETL iniciado a las: {Time}", DateTimeOffset.Now);
 
             try
             {
                 using var scope = _serviceProvider.CreateScope();
-                var staging = scope.ServiceProvider.GetRequiredService<StagingService>();
+                var handlerService = scope.ServiceProvider.GetRequiredService<IVentasHandlerService>();
 
-                // Extracción desde CSV
-                _logger.LogInformation("Iniciando extracción desde CSV...");
-                var csvExtractor = scope.ServiceProvider.GetRequiredService<ICsvExtractor<VentaCsv>>();
+                _logger.LogInformation("Iniciando pipeline de extracción, transformación y carga...");
+                var result = await handlerService.ProcessVentasDataAsync();
 
-                var ventasCsv = await csvExtractor.ExtractAsync();
-                await staging.SaveAsync(ventasCsv, "CSV", "Ventas_Crudas");
-                _logger.LogInformation("CSV extraído: {Count} registros.", ventasCsv.Count());
-
-                // Extracción desde API REST
-                _logger.LogInformation("Iniciando extracción desde API REST...");
-                var apiExtractor = scope.ServiceProvider.GetRequiredService<IApiExtractor<CustomerAPIDto>>();
-
-                var clientesApi = await apiExtractor.ExtractAsync();
-                await staging.SaveAsync(clientesApi, "API", "Clientes_API");
-                _logger.LogInformation("API extraída: {Count} registros.", clientesApi.Count());
-
-                // Extracción desde Base de Datos
-                _logger.LogInformation("Iniciando extracción desde SQL Server...");
-
-                var dbExtractor = scope.ServiceProvider.GetRequiredService<IDatabaseExtractor<ClienteDb>>();
-                var clientesDb = await dbExtractor.ExtractAsync();
-                await staging.SaveAsync(clientesDb, "Database", "Clientes_DB");
-
-                _logger.LogInformation("BD extraída: {Count} registros.", clientesDb.Count());
-                
-                _logger.LogInformation("Iniciando carga de dimensiones al Data Warehouse...");
-
-                var dwhLoadService = scope.ServiceProvider.GetRequiredService<SistemaVentas.Data.Persistence.Dwh.IDwhLoadService>();
-                await dwhLoadService.LoadDimensionsAsync();
-                _logger.LogInformation("Carga de dimensiones completada exitosamente.");
-
-                _logger.LogInformation("Proceso ETL completo (Extracción y Carga) finalizado exitosamente.");
-
+                if (result.IsSuccess)
+                    _logger.LogInformation("ETL completado exitosamente: {Message}", result.Message);
+                else
+                    _logger.LogWarning("ETL finalizado con advertencia: {Message}", result.Message);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error crítico durante la extracción: {Message}", ex.Message);
+                _logger.LogError(ex, "Error crítico durante el proceso ETL: {Message}", ex.Message);
             }
             finally
             {
