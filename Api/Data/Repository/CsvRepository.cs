@@ -102,12 +102,20 @@ namespace Api.Data.Repository
             for (int i = 1; i < lines.Length; i++)
             {
                 var parts = lines[i].Split(',');
-                if (parts.Length >= 5 && int.TryParse(parts[0], out int orderId))
+                if (parts.Length >= 3 && int.TryParse(parts[0], out int orderId))
                 {
                     int.TryParse(parts[1], out int productId);
                     int.TryParse(parts[2], out int quantity);
-                    decimal.TryParse(parts[3], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out decimal unitPrice);
-                    decimal.TryParse(parts[4], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out decimal totalPrice);
+                    
+                    decimal unitPrice = 0;
+                    decimal totalPrice = 0;
+
+                    if (parts.Length > 4) {
+                        decimal.TryParse(parts[3], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out unitPrice);
+                        decimal.TryParse(parts[4], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out totalPrice);
+                    } else if (parts.Length > 3) {
+                        decimal.TryParse(parts[3], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out totalPrice);
+                    }
 
                     result.Add(new OrderDetailAPI
                     {

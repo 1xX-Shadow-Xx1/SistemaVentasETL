@@ -59,7 +59,12 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             // ─── 2. TRUNCAR Fact_Ventas (ETL limpio cada vez) ─────────────
             using var dwhConn = new SqlConnection(_dwhConnectionString);
             await dwhConn.OpenAsync();
-            await dwhConn.ExecuteAsync("TRUNCATE TABLE Fact_Ventas");
+            try { 
+                await dwhConn.ExecuteAsync("TRUNCATE TABLE Fact_Ventas"); 
+                Console.WriteLine("[ETL] Fact_Ventas truncado correctamente.");
+            } catch (Exception ex) { 
+                Console.WriteLine($"[ETL ERROR] No se pudo truncar Fact_Ventas: {ex.Message}"); 
+            }
 
             // Dim_Cliente (DB + API enrichment)
             foreach (var cust in dbCustomers)
@@ -119,77 +124,104 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     });
             }
 
-            // ─── 3. FACT_VENTAS — DB ──────────────────────────────────────
+            // ─── 4. FACT_VENTAS — DB ──────────────────────────────────────
+            int dbInserted = 0;
+            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (DB)...");
             foreach (var order in dbOrders)
             {
-                var orderDate    = order.OrderDate ?? DateTime.Today;
-                int timeId       = int.Parse(orderDate.ToString("yyyyMMdd"));
-                var customer     = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
-                var ubicacionId  = customer?.CityId ?? 0;
-
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
+                try
                 {
-                    await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
-                        order.CustomerId ?? 0, ubicacionId, detail.Quantity,
-                        detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
-                }
-            }
+                    var orderDate = order.OrderDate ?? DateTime.Today;
+                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                    var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
+                    var ubicacionId = customer?.CityId ?? 0;
 
-            // ─── 4. FACT_VENTAS — CSV ─────────────────────────────────────
-            foreach (var order in csvOrders)
-            {
-                var orderDate   = order.OrderDate;
-                int timeId      = int.Parse(orderDate.ToString("yyyyMMdd"));
+                    await MergeDimTiempo(dwhConn, timeId, orderDate);
 
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                var details = csvOrderDetails.Where(d => d.OrderID == order.OrderID).ToList();
-                if (details.Count > 0)
-                {
-                    // Insert one row per detail line
-                    foreach (var detail in details)
-                    {
-                        await InsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID,
-                            order.CustomerID, 0, detail.Quantity,
-                            0m, detail.TotalPrice, "CSV");
-                    }
-                }
-                else
-                {
-                    // No matching details — insert the order itself as a summary row
-                    await InsertFactVentas(dwhConn, order.OrderID, timeId, 0,
-                        order.CustomerID, 0, 0, 0m, 0m, "CSV");
-                }
-            }
-
-            // ─── 5. FACT_VENTAS — API ─────────────────────────────────────
-            foreach (var order in apiOrders)
-            {
-                DateTime.TryParse(order.OrderDate, out DateTime orderDate);
-                if (orderDate == default) orderDate = DateTime.Today;
-                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
-
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                var apiDetails = apiOrderDetails.Where(d => d.OrderId == order.OrderId).ToList();
-                if (apiDetails.Count > 0)
-                {
-                    foreach (var detail in apiDetails)
+                    foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
                     {
                         await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
-                            order.CustomerId, 0, detail.Quantity,
-                            detail.UnitPrice, detail.TotalPrice, "API");
+                            order.CustomerId ?? 0, ubicacionId, detail.Quantity,
+                            detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
+                        dbInserted++;
                     }
                 }
-                else
-                {
-                    // No details from API — insert the order as a summary row
-                    await InsertFactVentas(dwhConn, order.OrderId, timeId, 0,
-                        order.CustomerId, 0, 0, 0m, 0m, "API");
-                }
+                catch (Exception ex) { Console.WriteLine($"[ETL WARN] DB Order {order.OrderId} failed: {ex.Message}"); }
             }
+            Console.WriteLine($"[ETL] DB → Insertados: {dbInserted} registros.");
+
+            // ─── 5. FACT_VENTAS — CSV ─────────────────────────────────────
+            int csvInserted = 0;
+            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (CSV)...");
+            foreach (var order in csvOrders)
+            {
+                try
+                {
+                    var orderDate = order.OrderDate;
+                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+
+                    await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                    var details = csvOrderDetails.Where(d => d.OrderID == order.OrderID).ToList();
+                    if (details.Count > 0)
+                    {
+                        foreach (var detail in details)
+                        {
+                            await InsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID,
+                                order.CustomerID, 0, detail.Quantity,
+                                0m, detail.TotalPrice, "CSV");
+                            csvInserted++;
+                        }
+                    }
+                    else
+                    {
+                        await InsertFactVentas(dwhConn, order.OrderID, timeId, 0,
+                            order.CustomerID, 0, 0, 0m, 0m, "CSV");
+                        csvInserted++;
+                    }
+                }
+                catch (Exception ex) { Console.WriteLine($"[ETL WARN] CSV Order {order.OrderID} failed: {ex.Message}"); }
+            }
+            Console.WriteLine($"[ETL] CSV → Insertados: {csvInserted} registros.");
+
+            // ─── 6. FACT_VENTAS — API ─────────────────────────────────────
+            int apiInserted = 0;
+            Console.WriteLine("[ETL] Iniciando carga de Fact_Ventas (API)...");
+            foreach (var order in apiOrders)
+            {
+                try
+                {
+                    DateTime.TryParse(order.OrderDate, out DateTime orderDate);
+                    if (orderDate == default) orderDate = DateTime.Today;
+                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+
+                    await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                    var apiDetails = apiOrderDetails.Where(d => d.OrderId == order.OrderId).ToList();
+                    if (apiDetails.Count > 0)
+                    {
+                        foreach (var detail in apiDetails)
+                        {
+                            await InsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId,
+                                order.CustomerId, 0, detail.Quantity,
+                                detail.UnitPrice, detail.TotalPrice, "API");
+                            apiInserted++;
+                        }
+                    }
+                    else
+                    {
+                        await InsertFactVentas(dwhConn, order.OrderId, timeId, 0,
+                            order.CustomerId, 0, 0, 0m, 0m, "API");
+                        apiInserted++;
+                    }
+                }
+                catch (Exception ex) { Console.WriteLine($"[ETL WARN] API Order {order.OrderId} failed: {ex.Message}"); }
+            }
+            Console.WriteLine($"[ETL] API → Insertados: {apiInserted} registros.");
+
+            Console.WriteLine("--------------------------------------------------");
+            Console.WriteLine($"[ETL COMPLETO] Total DB: {dbInserted}, CSV: {csvInserted}, API: {apiInserted}");
+            Console.WriteLine("--------------------------------------------------");
         }
 
         // ─── Helpers ──────────────────────────────────────────────────────
