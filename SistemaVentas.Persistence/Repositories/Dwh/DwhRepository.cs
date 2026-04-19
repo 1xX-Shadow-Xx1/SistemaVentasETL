@@ -59,235 +59,202 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             // ─── 2. SIN TRUNCATE (Carga Incremental) ──────────────────────
             using var dwhConn = new SqlConnection(_dwhConnectionString);
             await dwhConn.OpenAsync();
-            Console.WriteLine("[ETL] Iniciando proceso incremental (Upsert).");
+            Console.WriteLine("[ETL] Iniciando proceso incremental con Optimización Extrema ($O(1)$).");
 
-            // Dim_Cliente (DB + API enrichment)
+            // --- 2.1 Cache de Dimensiones para evitar MERGEs redundantes ---
+            var dwhCustomers = (await dwhConn.QueryAsync("SELECT ID_Cliente, Nombre_Cliente, Tipo_Cliente FROM Dim_Cliente"))
+                .ToDictionary(c => (int)c.ID_Cliente, c => $"{c.Nombre_Cliente}|{c.Tipo_Cliente}");
+
+            var dwhProducts = (await dwhConn.QueryAsync("SELECT ID_Producto, Nombre_Producto, Categoria, CAST(Precio_Base AS DECIMAL(18,2)) as Precio_Base FROM Dim_Producto"))
+                .ToDictionary(p => (int)p.ID_Producto, p => $"{p.Nombre_Producto}|{p.Categoria}|{p.Precio_Base}");
+
+            var dwhLocations = (await dwhConn.QueryAsync("SELECT ID_Ubicacion, Pais, Region, Ciudad FROM Dim_Ubicacion"))
+                .ToDictionary(l => (int)l.ID_Ubicacion, l => $"{l.Pais}|{l.Region}|{l.Ciudad}");
+
+            // --- 2.2 Upsert Inteligente de Dimensiones ---
             foreach (var cust in dbCustomers)
             {
                 var apiMatch = apiCustomers.FirstOrDefault(a => a.Id == cust.CustomerId);
-                await dwhConn.ExecuteAsync(@"
-                    MERGE Dim_Cliente AS t
-                    USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
-                    ON t.ID_Cliente = s.ID_Cliente
-                    WHEN MATCHED     THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
-                    WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
-                                          VALUES (s.ID_Cliente, s.Nombre_Cliente, s.Tipo_Cliente);",
-                    new
-                    {
-                        ID_Cliente     = cust.CustomerId,
-                        Nombre_Cliente = $"{cust.FirstName} {cust.LastName}",
-                        Tipo_Cliente   = apiMatch?.CustomerType ?? "Regular"
-                    });
+                string name = $"{cust.FirstName} {cust.LastName}";
+                string type = apiMatch?.CustomerType ?? "Regular";
+                string state = $"{name}|{type}";
+
+                if (!dwhCustomers.TryGetValue(cust.CustomerId, out var oldState) || oldState != state)
+                {
+                    await dwhConn.ExecuteAsync(@"
+                        MERGE Dim_Cliente AS t
+                        USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
+                        ON t.ID_Cliente = s.ID_Cliente
+                        WHEN MATCHED     THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
+                        WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (s.ID_Cliente, s.Nombre_Cliente, s.Tipo_Cliente);",
+                        new { ID_Cliente = cust.CustomerId, Nombre_Cliente = name, Tipo_Cliente = type });
+                }
             }
 
-            // Dim_Producto
             foreach (var prod in dbProducts)
             {
-                await dwhConn.ExecuteAsync(@"
-                    MERGE Dim_Producto AS t
-                    USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
-                    ON t.ID_Producto = s.ID_Producto
-                    WHEN MATCHED     THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
-                    WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
-                                          VALUES (s.ID_Producto, s.Nombre_Producto, s.Categoria, s.Precio_Base);",
-                    new
-                    {
-                        ID_Producto    = prod.ProductId,
-                        Nombre_Producto = prod.ProductName,
-                        Categoria      = prod.CategoryId.ToString(),
-                        Precio_Base    = prod.Price
-                    });
+                string state = $"{prod.ProductName}|{prod.CategoryId}|{prod.Price}";
+                if (!dwhProducts.TryGetValue(prod.ProductId, out var oldState) || oldState != state)
+                {
+                    await dwhConn.ExecuteAsync(@"
+                        MERGE Dim_Producto AS t
+                        USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
+                        ON t.ID_Producto = s.ID_Producto
+                        WHEN MATCHED     THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
+                        WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (s.ID_Producto, s.Nombre_Producto, s.Categoria, s.Precio_Base);",
+                        new { ID_Producto = prod.ProductId, Nombre_Producto = prod.ProductName, Categoria = prod.CategoryId.ToString(), Precio_Base = prod.Price });
+                }
             }
 
-            // Dim_Ubicacion
             foreach (var city in dbCities)
             {
                 var country = dbCountries.FirstOrDefault(c => c.CountryId == city.CountryId);
-                await dwhConn.ExecuteAsync(@"
-                    MERGE Dim_Ubicacion AS t
-                    USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad)
-                    ON t.ID_Ubicacion = s.ID_Ubicacion
-                    WHEN MATCHED     THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
-                    WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad)
-                                          VALUES (s.ID_Ubicacion, s.Pais, s.Region, s.Ciudad);",
-                    new
-                    {
-                        ID_Ubicacion = city.CityId,
-                        Pais         = country?.CountryName ?? "Desconocido",
-                        Region       = country?.CountryName ?? "Desconocido",
-                        Ciudad       = city.CityName
-                    });
+                string p = country?.CountryName ?? "Desconocido";
+                string r = country?.CountryName ?? "Desconocido";
+                string c = city.CityName;
+                string state = $"{p}|{r}|{c}";
+
+                if (!dwhLocations.TryGetValue(city.CityId, out var oldState) || oldState != state)
+                {
+                    await dwhConn.ExecuteAsync(@"
+                        MERGE Dim_Ubicacion AS t
+                        USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad)
+                        ON t.ID_Ubicacion = s.ID_Ubicacion
+                        WHEN MATCHED     THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
+                        WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (s.ID_Ubicacion, s.Pais, s.Region, s.Ciudad);",
+                        new { ID_Ubicacion = city.CityId, Pais = p, Region = r, Ciudad = c });
+                }
             }
 
-            // Cargar sets de IDs válidos para validación estricta
+            // --- 2.3 Cache de Hechos y Validaciones Estrictas ---
+            var existingFacts = (await dwhConn.QueryAsync(@"
+                SELECT ID_Transaccion, ID_Producto, Origen_Datos, Cantidad, 
+                       CAST(Total_Venta AS DECIMAL(18,2)) as Total_Venta, 
+                       ID_Cliente, ID_Ubicacion, ID_Tiempo
+                FROM Fact_Ventas"))
+                .GroupBy(f => $"{f.Origen_Datos}|{f.ID_Transaccion}|{f.ID_Producto}")
+                .ToDictionary(g => g.Key, g => {
+                    var f = g.First();
+                    return $"{f.Cantidad}|{f.Total_Venta}|{f.ID_Cliente}|{f.ID_Ubicacion}|{f.ID_Tiempo}";
+                });
+
             var validClientes = (await dwhConn.QueryAsync<int>("SELECT ID_Cliente FROM Dim_Cliente")).ToHashSet();
             var validProductos = (await dwhConn.QueryAsync<int>("SELECT ID_Producto FROM Dim_Producto")).ToHashSet();
             var validUbicaciones = (await dwhConn.QueryAsync<int>("SELECT ID_Ubicacion FROM Dim_Ubicacion")).ToHashSet();
 
+            // --- 2.4 Lookups para Detalles ($O(1)$ search) ---
+            var dbDetailsLookup = dbOrderDetails.ToLookup(d => d.OrderId);
+            var csvDetailsLookup = csvOrderDetails.ToLookup(d => d.OrderID);
+            var apiDetailsLookup = apiOrderDetails.ToLookup(d => d.OrderId);
+
             int dbProcessed = 0, csvProcessed = 0, apiProcessed = 0;
-            int dbSkipped = 0, csvSkipped = 0, apiSkipped = 0;
+            int skippedIntegrity = 0, noChangesCounter = 0;
 
             // ─── 4. FACT_VENTAS — DB ──────────────────────────────────────
             Console.WriteLine("[ETL] Procesando Fact_Ventas (DB)...");
             foreach (var order in dbOrders)
             {
-                try
+                var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
+                int cid = order.CustomerId ?? 0, uid = customer?.CityId ?? 0;
+                if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { skippedIntegrity++; continue; }
+
+                DateTime orderDate = order.OrderDate ?? DateTime.Today;
+                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                foreach (var detail in dbDetailsLookup[order.OrderId])
                 {
-                    var orderDate = order.OrderDate ?? DateTime.Today;
-                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
-                    var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
+                    if (!validProductos.Contains(detail.ProductId)) { skippedIntegrity++; continue; }
                     
-                    int cid = order.CustomerId ?? 0;
-                    int uid = customer?.CityId ?? 0;
+                    string key = $"DB|{order.OrderId}|{detail.ProductId}";
+                    string state = $"{detail.Quantity}|{detail.TotalPrice ?? 0m}|{cid}|{uid}|{timeId}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
 
-                    // Validación estricta: Cliente y Ubicación deben existir
-                    if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { dbSkipped++; continue; }
-
-                    await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                    foreach (var detail in dbOrderDetails.Where(d => d.OrderId == order.OrderId))
-                    {
-                        int pid = detail.ProductId;
-                        if (!validProductos.Contains(pid)) { dbSkipped++; continue; }
-
-                        await UpsertFactVentas(dwhConn, order.OrderId, timeId, pid,
-                            cid, uid, detail.Quantity,
-                            detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
-                        dbProcessed++;
-                    }
+                    await UpsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId, cid, uid, detail.Quantity, detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
+                    dbProcessed++;
                 }
-                catch (Exception ex) { Console.WriteLine($"[ETL WARN] DB Order {order.OrderId} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] DB → Procesados/Upsert: {dbProcessed}, Omitidos: {dbSkipped}");
 
             // ─── 5. FACT_VENTAS — CSV ─────────────────────────────────────
             Console.WriteLine("[ETL] Procesando Fact_Ventas (CSV)...");
             foreach (var order in csvOrders)
             {
-                try
+                if (!validClientes.Contains(order.CustomerID)) { skippedIntegrity++; continue; }
+
+                DateTime orderDate = order.OrderDate;
+                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                foreach (var detail in csvDetailsLookup[order.OrderID])
                 {
-                    var orderDate = order.OrderDate;
-                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                    if (!validProductos.Contains(detail.ProductID)) { skippedIntegrity++; continue; }
 
-                    int cid = order.CustomerID;
-                    // En CSV no tenemos info de ubicación, omitimos si la tabla DWH requiere integridad (y no manejamos ID 0)
-                    if (!validClientes.Contains(cid)) { csvSkipped++; continue; }
+                    string key = $"CSV|{order.OrderID}|{detail.ProductID}";
+                    string state = $"{detail.Quantity}|{detail.TotalPrice}|{order.CustomerID}|0|{timeId}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
 
-                    await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                    var details = csvOrderDetails.Where(d => d.OrderID == order.OrderID).ToList();
-                    if (details.Count > 0)
-                    {
-                        foreach (var detail in details)
-                        {
-                            int pid = detail.ProductID;
-                            if (!validProductos.Contains(pid)) { csvSkipped++; continue; }
-
-                            await UpsertFactVentas(dwhConn, order.OrderID, timeId, pid,
-                                cid, 0, detail.Quantity,
-                                0m, detail.TotalPrice, "CSV");
-                            csvProcessed++;
-                        }
-                    }
+                    await UpsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID, order.CustomerID, 0, detail.Quantity, 0m, detail.TotalPrice, "CSV");
+                    csvProcessed++;
                 }
-                catch (Exception ex) { Console.WriteLine($"[ETL WARN] CSV Order {order.OrderID} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] CSV → Procesados/Upsert: {csvProcessed}, Omitidos: {csvSkipped}");
 
             // ─── 6. FACT_VENTAS — API ─────────────────────────────────────
             Console.WriteLine("[ETL] Procesando Fact_Ventas (API)...");
             foreach (var order in apiOrders)
             {
-                try
+                if (!validClientes.Contains(order.CustomerId)) { skippedIntegrity++; continue; }
+
+                DateTime.TryParse(order.OrderDate, out DateTime orderDate);
+                if (orderDate == default) orderDate = DateTime.Today;
+                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, timeId, orderDate);
+
+                foreach (var detail in apiDetailsLookup[order.OrderId])
                 {
-                    DateTime.TryParse(order.OrderDate, out DateTime orderDate);
-                    if (orderDate == default) orderDate = DateTime.Today;
-                    int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
+                    if (!validProductos.Contains(detail.ProductId)) { skippedIntegrity++; continue; }
 
-                    int cid = order.CustomerId;
-                    if (!validClientes.Contains(cid)) { apiSkipped++; continue; }
+                    string key = $"API|{order.OrderId}|{detail.ProductId}";
+                    string state = $"{detail.Quantity}|{detail.TotalPrice}|{order.CustomerId}|0|{timeId}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
 
-                    await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                    var apiDetails = apiOrderDetails.Where(d => d.OrderId == order.OrderId).ToList();
-                    if (apiDetails.Count > 0)
-                    {
-                        foreach (var detail in apiDetails)
-                        {
-                            int pid = detail.ProductId;
-                            if (!validProductos.Contains(pid)) { apiSkipped++; continue; }
-
-                            await UpsertFactVentas(dwhConn, order.OrderId, timeId, pid,
-                                cid, 0, detail.Quantity,
-                                detail.UnitPrice, detail.TotalPrice, "API");
-                            apiProcessed++;
-                        }
-                    }
+                    await UpsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId, order.CustomerId, 0, detail.Quantity, detail.UnitPrice, detail.TotalPrice, "API");
+                    apiProcessed++;
                 }
-                catch (Exception ex) { Console.WriteLine($"[ETL WARN] API Order {order.OrderId} failed: {ex.Message}"); }
             }
-            Console.WriteLine($"[ETL] API → Procesados/Upsert: {apiProcessed}, Omitidos: {apiSkipped}");
 
             Console.WriteLine("--------------------------------------------------");
-            Console.WriteLine($"[ETL COMPLETO] Total DB: {dbProcessed}, CSV: {csvProcessed}, API: {apiProcessed}");
-            Console.WriteLine($"[CALIDAD] Registros omitidos: {dbSkipped + csvSkipped + apiSkipped}");
+            Console.WriteLine($"[RESUMEN FINAL]");
+            Console.WriteLine($"→ Actualizados/Nuevos: {dbProcessed + csvProcessed + apiProcessed}");
+            Console.WriteLine($"→ Sincronizados (Sin cambios): {noChangesCounter}");
+            Console.WriteLine($"→ Omitidos (Calidad/ID 0): {skippedIntegrity}");
             Console.WriteLine("--------------------------------------------------");
         }
 
-        // ─── Helpers ──────────────────────────────────────────────────────
         private static async Task MergeDimTiempo(SqlConnection conn, int timeId, DateTime date)
         {
             await conn.ExecuteAsync(@"
                 MERGE Dim_Tiempo AS t
-                USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia)
-                      AS s (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
+                USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia) AS s (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
                 ON t.ID_Tiempo = s.ID_Tiempo
-                WHEN NOT MATCHED THEN
-                    INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
-                    VALUES (s.ID_Tiempo, s.Fecha, s.Anio, s.Trimestre, s.Mes, s.Nombre_Mes, s.Dia);",
-                new
-                {
-                    ID_Tiempo  = timeId,
-                    Fecha      = date.Date,
-                    Anio       = date.Year,
-                    Trimestre  = (date.Month - 1) / 3 + 1,
-                    Mes        = date.Month,
-                    Nombre_Mes = date.ToString("MMMM"),
-                    Dia        = date.Day
-                });
+                WHEN NOT MATCHED THEN INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
+                VALUES (s.ID_Tiempo, s.Fecha, s.Anio, s.Trimestre, s.Mes, s.Nombre_Mes, s.Dia);",
+                new { ID_Tiempo = timeId, Fecha = date.Date, Anio = date.Year, Trimestre = (date.Month - 1) / 3 + 1, Mes = date.Month, Nombre_Mes = date.ToString("MMMM"), Dia = date.Day });
         }
 
-        private static async Task UpsertFactVentas(SqlConnection conn,
-            int transId, int timeId, int productId, int clienteId, int ubicacionId,
-            int cantidad, decimal unitPrice, decimal totalPrice, string origen)
+        private static async Task UpsertFactVentas(SqlConnection conn, int transId, int timeId, int productId, int clienteId, int ubicacionId, int cantidad, decimal unitPrice, decimal totalPrice, string origen)
         {
             await conn.ExecuteAsync(@"
                 MERGE Fact_Ventas AS t
-                USING (SELECT @ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, 
-                              @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos) 
-                      AS s (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, 
-                            Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
+                USING (SELECT @ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos) 
+                      AS s (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
                 ON t.ID_Transaccion = s.ID_Transaccion AND t.Origen_Datos = s.Origen_Datos AND t.ID_Producto = s.ID_Producto
-                WHEN MATCHED THEN
-                    UPDATE SET ID_Tiempo = s.ID_Tiempo, ID_Cliente = s.ID_Cliente, ID_Ubicacion = s.ID_Ubicacion,
+                WHEN MATCHED THEN 
+                    UPDATE SET ID_Tiempo = s.ID_Tiempo, ID_Cliente = s.ID_Cliente, ID_Ubicacion = s.ID_Ubicacion, 
                                Cantidad = s.Cantidad, Precio_Unitario = s.Precio_Unitario, Total_Venta = s.Total_Venta
-                WHEN NOT MATCHED THEN
-                    INSERT (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion,
-                            Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                    VALUES (s.ID_Transaccion, s.ID_Tiempo, s.ID_Producto, s.ID_Cliente, s.ID_Ubicacion,
-                            s.Cantidad, s.Precio_Unitario, s.Total_Venta, s.Origen_Datos);",
-                new
-                {
-                    ID_Transaccion = transId,
-                    ID_Tiempo      = timeId,
-                    ID_Producto    = productId,
-                    ID_Cliente     = clienteId,
-                    ID_Ubicacion   = ubicacionId,
-                    Cantidad       = cantidad,
-                    Precio_Unitario = unitPrice,
-                    Total_Venta    = totalPrice,
-                    Origen_Datos   = origen
-                });
+                WHEN NOT MATCHED THEN 
+                    INSERT (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
+                    VALUES (s.ID_Transaccion, s.ID_Tiempo, s.ID_Producto, s.ID_Cliente, s.ID_Ubicacion, s.Cantidad, s.Precio_Unitario, s.Total_Venta, s.Origen_Datos);",
+                new { ID_Transaccion = transId, ID_Tiempo = timeId, ID_Producto = productId, ID_Cliente = clienteId, ID_Ubicacion = ubicacionId, Cantidad = cantidad, Precio_Unitario = unitPrice, Total_Venta = totalPrice, Origen_Datos = origen });
         }
     }
 }

@@ -43,8 +43,8 @@ namespace SistemaVentasETL.Worker
             }
             finally
             {
-                _logger.LogInformation("La aplicación se cerrará en 10 segundos...");
-                await Task.Delay(10000);
+                _logger.LogInformation("La aplicación se cerrará en 5 minutos...");
+                await Task.Delay(5 * 60 * 1000);
                 Environment.Exit(0);
             }
         }
