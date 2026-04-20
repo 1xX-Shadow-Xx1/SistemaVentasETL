@@ -56,5 +56,32 @@ namespace SistemaVentas.Persistence.Repositories.Csv
             }
             return result;
         }
+
+        public async Task<IEnumerable<CustomerCsv>> GetCustomersAsync()
+        {
+            var path = _configuration["CsvPaths:Customers"];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return [];
+
+            var lines = await File.ReadAllLinesAsync(path);
+            var result = new List<CustomerCsv>();
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var parts = lines[i].Split(',');
+                if (parts.Length >= 7 && int.TryParse(parts[0], out int id))
+                {
+                    result.Add(new CustomerCsv
+                    {
+                        CustomerID = id,
+                        FirstName = parts[1],
+                        LastName = parts[2],
+                        Email = parts[3],
+                        Phone = parts[4],
+                        City = parts[5].Trim(),
+                        Country = parts[6].Trim()
+                    });
+                }
+            }
+            return result;
+        }
     }
 }

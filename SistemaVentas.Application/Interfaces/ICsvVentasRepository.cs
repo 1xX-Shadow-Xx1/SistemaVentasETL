@@ -6,5 +6,6 @@ namespace SistemaVentas.Application.Interfaces
     {
         Task<IEnumerable<OrderCsv>> GetVentasAsync();
         Task<IEnumerable<OrderDetailCsv>> GetOrderDetailsAsync();
+        Task<IEnumerable<CustomerCsv>> GetCustomersAsync();
     }
 }

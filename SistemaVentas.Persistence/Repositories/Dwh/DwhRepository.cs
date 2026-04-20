@@ -43,6 +43,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             IEnumerable<OrderDetailAPIDto> ApiOrderDetails,
             IEnumerable<OrderCsv> CsvOrders,
             IEnumerable<OrderDetailCsv> CsvOrderDetails,
+            IEnumerable<CustomerCsv> CsvCustomers,
             IEnumerable<Customer> DbCustomers,
             IEnumerable<Order> DbOrders,
             IEnumerable<OrderDetail> DbOrderDetails,
@@ -86,6 +87,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             var apiOrderDetails = await _apiRepository.GetOrderDetailsAsync();
             var csvOrders = await _csvRepository.GetVentasAsync();
             var csvOrderDetails = await _csvRepository.GetOrderDetailsAsync();
+            var csvCustomers = await _csvRepository.GetCustomersAsync();
 
             using var salesConn = new SqlConnection(_configuration.GetConnectionString("VentasDatabase"));
             var dbCustomers = await salesConn.QueryAsync<Customer>("SELECT * FROM Customer");
@@ -100,7 +102,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
 
             return new ExtractedData(
                 apiCustomers, apiOrders, apiOrderDetails,
-                csvOrders, csvOrderDetails,
+                csvOrders, csvOrderDetails, csvCustomers,
                 dbCustomers, dbOrders, dbOrderDetails,
                 dbProducts, dbCities, dbCountries
             );
@@ -140,8 +142,6 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         Tipo_Cliente = apiMatch?.CustomerType ?? "Regular"
                     };
                 }).ToList();
-                if (!newClientes.Any(c => c.ID_Cliente == 0)) 
-                    newClientes.Add(new DimCliente { ID_Cliente = 0, Nombre_Cliente = "Cliente Desconocido", Tipo_Cliente = "N/A" });
                 await _context.DimClientes.AddRangeAsync(newClientes);
 
                 var newProds = data.DbProducts.Select(p => new DimProducto {
@@ -150,8 +150,6 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     Categoria = p.CategoryId.ToString(),
                     Precio_Base = p.Price
                 }).ToList();
-                if (!newProds.Any(p => p.ID_Producto == 0))
-                    newProds.Add(new DimProducto { ID_Producto = 0, Nombre_Producto = "Producto N/A", Categoria = "N/A", Precio_Base = 0m });
                 await _context.DimProductos.AddRangeAsync(newProds);
 
                 var countryMap = data.DbCountries.ToDictionary(c => c.CountryId, c => c.CountryName);
@@ -164,8 +162,6 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         Ciudad = city.CityName
                     };
                 }).ToList();
-                if (!newLocs.Any(l => l.ID_Ubicacion == 0))
-                    newLocs.Add(new DimUbicacion { ID_Ubicacion = 0, Pais = "N/A", Region = "N/A", Ciudad = "N/A" });
                 await _context.DimUbicaciones.AddRangeAsync(newLocs);
 
                 await _context.SaveChangesAsync();
@@ -184,10 +180,10 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             try
             {
                 _logger.LogInformation("[ETL] Cargando fact...");
-
                 var validClientes = await _context.DimClientes.ToDictionaryAsync(c => c.ID_Cliente);
                 var validProds = await _context.DimProductos.ToDictionaryAsync(p => p.ID_Producto);
                 var validLocs = await _context.DimUbicaciones.ToDictionaryAsync(u => u.ID_Ubicacion);
+                var validLocsByName = await _context.DimUbicaciones.ToDictionaryAsync(u => u.Ciudad.ToLower().Trim());
 
                 var allDates = data.DbOrders.Select(o => o.OrderDate ?? DateTime.Today)
                     .Concat(data.CsvOrders.Select(o => o.OrderDate))
@@ -198,16 +194,21 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                 await LoadDimTiempoAsync(allDates);
                 var validTiempos = await _context.DimTiempos.ToDictionaryAsync(t => t.ID_Tiempo);
 
+                var apiCustLookup = data.ApiCustomers.ToDictionary(c => c.Id);
+                var csvCustLookup = data.CsvCustomers.ToDictionary(c => c.CustomerID);
+
                 var factList = new List<FactVenta>();
                 int processed = 0, skipped = 0;
 
                 var dbLookup = data.DbOrderDetails.ToLookup(d => d.OrderId);
                 foreach (var order in data.DbOrders)
                 {
-                    int cid = order.CustomerId ?? 0, uid = data.DbCustomers.FirstOrDefault(c => c.CustomerId == cid)?.CityId ?? 0;
+                    int cid = order.CustomerId ?? 0;
+                    int uid = data.DbCustomers.FirstOrDefault(c => c.CustomerId == cid)?.CityId ?? 0;
                     int tid = int.Parse((order.OrderDate ?? DateTime.Today).ToString("yyyyMMdd"));
 
-                    if (!validClientes.ContainsKey(cid) || !validLocs.ContainsKey(uid) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
+                    if (!validClientes.ContainsKey(cid) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
+                    int? locationId = validLocs.ContainsKey(uid) ? uid : null;
 
                     var detailedLines = dbLookup[order.OrderId].GroupBy(d => d.ProductId);
                     foreach (var group in detailedLines)
@@ -218,7 +219,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         int totalQty = group.Sum(g => g.Quantity);
                         decimal totalPrice = group.Sum(g => g.TotalPrice ?? 0m);
 
-                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, cid, uid, totalQty, first.UnitPrice ?? 0m, totalPrice, "DB"));
+                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, cid, locationId, totalQty, first.UnitPrice ?? 0m, totalPrice, "DB"));
                         processed++;
                         await CheckBatchSave(factList);
                     }
@@ -230,6 +231,13 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                     int tid = int.Parse(order.OrderDate.ToString("yyyyMMdd"));
                     if (!validClientes.ContainsKey(order.CustomerID) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
 
+                    int? locationId = null;
+                    if (csvCustLookup.TryGetValue(order.CustomerID, out var customer))
+                    {
+                        var cityKey = (customer.City ?? "").ToLower().Trim();
+                        if (validLocsByName.TryGetValue(cityKey, out var loc)) locationId = loc.ID_Ubicacion;
+                    }
+
                     var detailedLines = csvLookup[order.OrderID].GroupBy(d => d.ProductID);
                     foreach (var group in detailedLines)
                     {
@@ -239,7 +247,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         int totalQty = group.Sum(g => g.Quantity);
                         decimal totalPrice = group.Sum(g => g.TotalPrice);
 
-                        factList.Add(CreateFact(order.OrderID, tid, first.ProductID, order.CustomerID, 0, totalQty, 0m, totalPrice, "CSV"));
+                        factList.Add(CreateFact(order.OrderID, tid, first.ProductID, order.CustomerID, locationId, totalQty, 0m, totalPrice, "CSV"));
                         processed++;
                         await CheckBatchSave(factList);
                     }
@@ -248,10 +256,16 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                 var apiLookup = data.ApiOrderDetails.ToLookup(d => d.OrderId);
                 foreach (var order in data.ApiOrders)
                 {
-                    if (!validClientes.ContainsKey(order.CustomerId)) { skipped++; continue; }
                     DateTime.TryParse(order.OrderDate, out DateTime date); if (date == default) date = DateTime.Today;
                     int tid = int.Parse(date.ToString("yyyyMMdd"));
-                    if (!validTiempos.ContainsKey(tid)) { skipped++; continue; }
+                    if (!validClientes.ContainsKey(order.CustomerId) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
+
+                    int? locationId = null;
+                    if (apiCustLookup.TryGetValue(order.CustomerId, out var customer))
+                    {
+                        var cityKey = (customer.City ?? "").ToLower().Trim();
+                        if (validLocsByName.TryGetValue(cityKey, out var loc)) locationId = loc.ID_Ubicacion;
+                    }
 
                     var detailedLines = apiLookup[order.OrderId].GroupBy(d => d.ProductId);
                     foreach (var group in detailedLines)
@@ -262,7 +276,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                         int totalQty = group.Sum(g => g.Quantity);
                         decimal totalPrice = group.Sum(g => g.TotalPrice);
 
-                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, order.CustomerId, 0, totalQty, first.UnitPrice, totalPrice, "API"));
+                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, order.CustomerId, locationId, totalQty, first.UnitPrice, totalPrice, "API"));
                         processed++;
                         await CheckBatchSave(factList);
                     }
@@ -285,7 +299,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             }
         }
 
-        private FactVenta CreateFact(int transId, int timeId, int prodId, int clieId, int ubicId, int qty, decimal price, decimal total, string source)
+        private FactVenta CreateFact(int transId, int timeId, int prodId, int clieId, int? ubicId, int qty, decimal price, decimal total, string source)
         {
             return new FactVenta {
                 ID_Transaccion = transId, ID_Tiempo = timeId, ID_Producto = prodId, ID_Cliente = clieId, ID_Ubicacion = ubicId,

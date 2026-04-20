@@ -32,7 +32,9 @@ namespace Api.Data.Repository
                     {
                         Id = id,
                         Name = $"{parts[1]} {parts[2]}".Trim(),
-                        CustomerType = "Regular"
+                        CustomerType = "Regular",
+                        City = parts.Length > 5 ? parts[5].Trim() : string.Empty,
+                        Country = parts.Length > 6 ? parts[6].Trim() : string.Empty
                     });
                 }
             }

@@ -13,7 +13,7 @@ namespace SistemaVentas.Domain.Entities.Dwh.Facts
         public int ID_Tiempo { get; set; }
         public int ID_Producto { get; set; }
         public int ID_Cliente { get; set; }
-        public int ID_Ubicacion { get; set; }
+        public int? ID_Ubicacion { get; set; }
         public int Cantidad { get; set; }
         [Column(TypeName = "decimal(10,2)")]
         public decimal Precio_Unitario { get; set; }
