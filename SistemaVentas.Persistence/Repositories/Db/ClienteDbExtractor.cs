@@ -7,7 +7,6 @@ using System.Threading.Tasks;
 
 namespace SistemaVentas.Persistence.Repositories.Db
 {
-    // Contexto de base de datos para la extracción desde el sistema relacional (OLTP)
     public class VentasDbContext : DbContext
     {
         public VentasDbContext(DbContextOptions<VentasDbContext> options) : base(options) { }
@@ -37,7 +36,6 @@ namespace SistemaVentas.Persistence.Repositories.Db
         }
     }
 
-    // Estructura DTO para retornar todas las tablas juntas en un solo objeto iterable
     public class VentasDbData
     {
         public List<Category> Categories { get; set; } = new();
@@ -84,7 +82,6 @@ namespace SistemaVentas.Persistence.Repositories.Db
                 Statuses = await context.Statuses.ToListAsync()
             };
 
-            // Retornamos un enumerable de 1 solo elemento que contiene todas las listas extraídas
             return new List<VentasDbData> { dbData };
         }
     }

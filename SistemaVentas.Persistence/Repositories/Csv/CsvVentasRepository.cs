@@ -40,7 +40,6 @@ namespace SistemaVentas.Persistence.Repositories.Csv
 
             var lines = await File.ReadAllLinesAsync(path);
             var result = new List<OrderDetailCsv>();
-            // CSV Columns: OrderID,ProductID,Quantity,UnitPrice,TotalPrice  (UnitPrice may not exist in entity but we read it anyway)
             for (int i = 1; i < lines.Length; i++)
             {
                 var parts = lines[i].Split(',');

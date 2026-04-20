@@ -8,7 +8,7 @@ namespace SistemaVentas.Domain.Entities.Dwh.Dimensions
     {
         [Key]
         [DatabaseGenerated(DatabaseGeneratedOption.None)]
-        public int ID_Tiempo { get; set; } // Formato YYYYMMDD
+        public int ID_Tiempo { get; set; }
         public DateTime Fecha { get; set; }
         public int Anio { get; set; }
         public int Trimestre { get; set; }

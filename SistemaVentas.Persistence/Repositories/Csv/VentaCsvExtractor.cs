@@ -15,7 +15,6 @@ namespace SistemaVentas.Persistence.Repositories.Csv
     {
         private readonly IConfiguration _config;
 
-        // Lee la ruta desde el appsettings del Worker
         public string FilePath => _config["CsvSettings:VentasFilePath"] ?? "Datos\\ventas.csv";
 
         public string SourceType => "CSV";

@@ -23,8 +23,12 @@ namespace SistemaVentasETL.Worker
                 var handlerService = scope.ServiceProvider.GetRequiredService<IVentasHandlerService>();
 
                 _logger.LogInformation("[ETL] Iniciando proceso...");
-                await handlerService.ProcessVentasDataAsync();
-                _logger.LogInformation("[ETL] Proceso finalizado.");
+                var result = await handlerService.ProcessVentasDataAsync();
+
+                if (result.IsSuccess)
+                    _logger.LogInformation("[ETL] Proceso finalizado exitosamente: {Message}", result.Message);
+                else
+                    _logger.LogWarning("[ETL] Proceso finalizado con advertencias: {Message}", result.Message);
             }
             catch (Exception ex)
             {

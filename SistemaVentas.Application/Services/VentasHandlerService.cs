@@ -14,18 +14,7 @@ namespace SistemaVentas.Application.Services
 
         public async Task<ServiceResult> ProcessVentasDataAsync()
         {
-            var result = new ServiceResult();
-            try
-            {
-                await _dwhRepository.LoadVentasDataAsync();
-                result.Message = "ETL completado exitosamente.";
-            }
-            catch (Exception ex)
-            {
-                result.IsSuccess = false;
-                result.Message = ex.Message;
-            }
-            return result;
+            return await _dwhRepository.LoadVentasDataAsync();
         }
     }
 }

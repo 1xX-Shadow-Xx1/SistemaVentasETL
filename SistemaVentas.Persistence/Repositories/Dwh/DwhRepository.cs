@@ -1,197 +1,324 @@
-using Dapper;
-using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Configuration;
+using Microsoft.EntityFrameworkCore;
 using SistemaVentas.Application.Interfaces;
+using SistemaVentas.Domain.Entities.Dwh.Dimensions;
+using SistemaVentas.Domain.Entities.Dwh.Facts;
+using SistemaVentas.Persistence.Repositories.Dwh.Context;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Data.SqlClient;
+using Dapper;
+using SistemaVentas.Domain.Entities.Csv;
+using SistemaVentas.Domain.Entities.Api;
 using SistemaVentas.Data.Models;
+using SistemaVentas.Application.Result;
+using System.Globalization;
+using Microsoft.Extensions.Logging;
 
 namespace SistemaVentas.Persistence.Repositories.Dwh
 {
     public class DwhRepository : IDwhRepository
     {
-        private readonly string _dwhConnectionString;
-        private readonly string _ventasConnectionString;
+        private readonly VentasDwhContext _context;
+        private readonly IConfiguration _configuration;
         private readonly IClienteApiRepository _apiRepository;
         private readonly ICsvVentasRepository _csvRepository;
+        private readonly ILogger<DwhRepository> _logger;
 
         public DwhRepository(
+            VentasDwhContext context,
             IConfiguration configuration,
             IClienteApiRepository apiRepository,
-            ICsvVentasRepository csvRepository)
+            ICsvVentasRepository csvRepository,
+            ILogger<DwhRepository> logger)
         {
-            _dwhConnectionString = configuration.GetConnectionString("DwhDatabase")
-                ?? throw new ArgumentNullException("ConnectionStrings:DwhDatabase no configurado");
-            _ventasConnectionString = configuration.GetConnectionString("VentasDatabase")
-                ?? throw new ArgumentNullException("ConnectionStrings:VentasDatabase no configurado");
+            _context = context;
+            _configuration = configuration;
             _apiRepository = apiRepository;
             _csvRepository = csvRepository;
+            _logger = logger;
         }
 
-        public async Task LoadVentasDataAsync()
+        private record ExtractedData(
+            IEnumerable<CustomerAPIDto> ApiCustomers,
+            IEnumerable<OrderAPIDto> ApiOrders,
+            IEnumerable<OrderDetailAPIDto> ApiOrderDetails,
+            IEnumerable<OrderCsv> CsvOrders,
+            IEnumerable<OrderDetailCsv> CsvOrderDetails,
+            IEnumerable<Customer> DbCustomers,
+            IEnumerable<Order> DbOrders,
+            IEnumerable<OrderDetail> DbOrderDetails,
+            IEnumerable<Product> DbProducts,
+            IEnumerable<City> DbCities,
+            IEnumerable<Country> DbCountries
+        );
+
+        public async Task<ServiceResult> LoadVentasDataAsync()
         {
-            Console.WriteLine("[ETL] Iniciando extracción de datos fuentes...");
-            var apiCustomers    = await _apiRepository.GetCustomersAsync();
-            var apiOrders       = await _apiRepository.GetOrdersAsync();
+            var result = new ServiceResult();
+            try
+            {
+                _logger.LogInformation("[ETL] Proceso iniciado conforme al patrón del profesor.");
+
+                var data = await ExtractDataSourcesAsync();
+
+                result = await CleanDwhTablesAsync();
+                if (!result.IsSuccess) return result;
+
+                await LoadDimensionsAsync(data);
+
+                result = await LoadFactVentasAsync(data);
+            }
+            catch (Exception ex)
+            {
+                result.IsSuccess = false;
+                result.Message = $"Error crítico en el proceso ETL: {ex.Message}";
+                _logger.LogError(ex, "[ETL] ERROR: {Message}", ex.Message);
+            }
+
+            return result;
+        }
+
+        private async Task<ExtractedData> ExtractDataSourcesAsync()
+        {
+            _logger.LogInformation("[ETL] Extrayendo datos de todas las fuentes...");
+
+            var apiCustomers = await _apiRepository.GetCustomersAsync();
+            var apiOrders = await _apiRepository.GetOrdersAsync();
             var apiOrderDetails = await _apiRepository.GetOrderDetailsAsync();
-            var csvOrders       = await _csvRepository.GetVentasAsync();
+            var csvOrders = await _csvRepository.GetVentasAsync();
             var csvOrderDetails = await _csvRepository.GetOrderDetailsAsync();
 
-            using var ventasConn = new SqlConnection(_ventasConnectionString);
-            var dbCustomers    = await ventasConn.QueryAsync<Customer>("SELECT * FROM Customer");
-            var dbOrders       = await ventasConn.QueryAsync<Order>("SELECT * FROM [Order]");
-            var dbOrderDetails = await ventasConn.QueryAsync<OrderDetail>("SELECT * FROM Order_Detail");
-            var dbProducts     = await ventasConn.QueryAsync<Product>("SELECT * FROM Product");
-            var dbCities       = await ventasConn.QueryAsync<City>("SELECT * FROM City");
-            var dbCountries    = await ventasConn.QueryAsync<Country>("SELECT * FROM Country");
+            using var salesConn = new SqlConnection(_configuration.GetConnectionString("VentasDatabase"));
+            var dbCustomers = await salesConn.QueryAsync<Customer>("SELECT * FROM Customer");
+            var dbOrders = await salesConn.QueryAsync<Order>("SELECT * FROM [Order]");
+            var dbOrderDetails = await salesConn.QueryAsync<OrderDetail>("SELECT * FROM Order_Detail");
+            var dbProducts = await salesConn.QueryAsync<Product>("SELECT * FROM Product");
+            var dbCities = await salesConn.QueryAsync<City>("SELECT * FROM City");
+            var dbCountries = await salesConn.QueryAsync<Country>("SELECT * FROM Country");
 
-            Console.WriteLine($"[ETL] Extracción finalizada (API: {apiOrders.Count()}, CSV: {csvOrders.Count()}, DB: {dbOrders.Count()})");
+            _logger.LogInformation("[ETL] Extracción finalizada. API: {ApiCount}, CSV: {CsvCount}, DB: {DbCount}", 
+                apiOrders.Count(), csvOrders.Count(), dbOrders.Count());
 
-            using var dwhConn = new SqlConnection(_dwhConnectionString);
-            await dwhConn.OpenAsync();
-
-            Console.WriteLine("[ETL] Sincronizando dimensiones...");
-            var dwhCustomers = (await dwhConn.QueryAsync("SELECT ID_Cliente, Nombre_Cliente, Tipo_Cliente FROM Dim_Cliente"))
-                .ToDictionary(c => (int)c.ID_Cliente, c => $"{c.Nombre_Cliente}|{c.Tipo_Cliente}");
-
-            var dwhProducts = (await dwhConn.QueryAsync("SELECT ID_Producto, Nombre_Producto, Categoria, CAST(Precio_Base AS DECIMAL(18,2)) as Precio_Base FROM Dim_Producto"))
-                .ToDictionary(p => (int)p.ID_Producto, p => $"{p.Nombre_Producto}|{p.Categoria}|{p.Precio_Base}");
-
-            var dwhLocations = (await dwhConn.QueryAsync("SELECT ID_Ubicacion, Pais, Region, Ciudad FROM Dim_Ubicacion"))
-                .ToDictionary(l => (int)l.ID_Ubicacion, l => $"{l.Pais}|{l.Region}|{l.Ciudad}");
-
-            foreach (var cust in dbCustomers)
-            {
-                var apiMatch = apiCustomers.FirstOrDefault(a => a.Id == cust.CustomerId);
-                string name = $"{cust.FirstName} {cust.LastName}", type = apiMatch?.CustomerType ?? "Regular", state = $"{name}|{type}";
-                if (!dwhCustomers.TryGetValue(cust.CustomerId, out var old) || old != state)
-                {
-                    await dwhConn.ExecuteAsync(@"MERGE Dim_Cliente AS t USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente) ON t.ID_Cliente = s.ID_Cliente
-                        WHEN MATCHED THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
-                        WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (s.ID_Cliente, s.Nombre_Cliente, s.Tipo_Cliente);",
-                        new { ID_Cliente = cust.CustomerId, Nombre_Cliente = name, Tipo_Cliente = type });
-                }
-            }
-
-            foreach (var prod in dbProducts)
-            {
-                string state = $"{prod.ProductName}|{prod.CategoryId}|{prod.Price}";
-                if (!dwhProducts.TryGetValue(prod.ProductId, out var old) || old != state)
-                {
-                    await dwhConn.ExecuteAsync(@"MERGE Dim_Producto AS t USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base) ON t.ID_Producto = s.ID_Producto
-                        WHEN MATCHED THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
-                        WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (s.ID_Producto, s.Nombre_Producto, s.Categoria, s.Precio_Base);",
-                        new { ID_Producto = prod.ProductId, Nombre_Producto = prod.ProductName, Categoria = prod.CategoryId.ToString(), Precio_Base = prod.Price });
-                }
-            }
-
-            foreach (var city in dbCities)
-            {
-                var country = dbCountries.FirstOrDefault(c => c.CountryId == city.CountryId);
-                string p = country?.CountryName ?? "Unknown", r = p, c = city.CityName, state = $"{p}|{r}|{c}";
-                if (!dwhLocations.TryGetValue(city.CityId, out var old) || old != state)
-                {
-                    await dwhConn.ExecuteAsync(@"MERGE Dim_Ubicacion AS t USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad) ON t.ID_Ubicacion = s.ID_Ubicacion
-                        WHEN MATCHED THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
-                        WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (s.ID_Ubicacion, s.Pais, s.Region, s.Ciudad);",
-                        new { ID_Ubicacion = city.CityId, Pais = p, Region = r, Ciudad = c });
-                }
-            }
-
-            Console.WriteLine("[ETL] Cargando historial del DWH para comparación...");
-            var existingFacts = (await dwhConn.QueryAsync("SELECT ID_Transaccion, ID_Producto, Origen_Datos, Cantidad, CAST(Total_Venta AS DECIMAL(18,2)) as Total_Venta, ID_Cliente, ID_Ubicacion, ID_Tiempo FROM Fact_Ventas"))
-                .GroupBy(f => $"{f.Origen_Datos}|{f.ID_Transaccion}|{f.ID_Producto}").ToDictionary(g => g.Key, g => { var f = g.First(); return $"{f.Cantidad}|{f.Total_Venta}|{f.ID_Cliente}|{f.ID_Ubicacion}|{f.ID_Tiempo}"; });
-
-            var validClientes = (await dwhConn.QueryAsync<int>("SELECT ID_Cliente FROM Dim_Cliente")).ToHashSet();
-            var validProductos = (await dwhConn.QueryAsync<int>("SELECT ID_Producto FROM Dim_Producto")).ToHashSet();
-            var validUbicaciones = (await dwhConn.QueryAsync<int>("SELECT ID_Ubicacion FROM Dim_Ubicacion")).ToHashSet();
-
-            var dbLookup = dbOrderDetails.ToLookup(d => d.OrderId);
-            var csvLookup = csvOrderDetails.ToLookup(d => d.OrderID);
-            var apiLookup = apiOrderDetails.ToLookup(d => d.OrderId);
-
-            int processed = 0, skipped = 0, noChange = 0;
-
-            Console.WriteLine("[ETL] Procesando Fuente: Base de Datos...");
-            foreach (var order in dbOrders)
-            {
-                var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
-                int cid = order.CustomerId ?? 0, uid = customer?.CityId ?? 0;
-                if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { skipped++; continue; }
-
-                DateTime date = order.OrderDate ?? DateTime.Today;
-                int tid = int.Parse(date.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, tid, date);
-
-                foreach (var detail in dbLookup[order.OrderId])
-                {
-                    if (!validProductos.Contains(detail.ProductId)) { skipped++; continue; }
-                    string key = $"DB|{order.OrderId}|{detail.ProductId}", state = $"{detail.Quantity}|{detail.TotalPrice ?? 0m}|{cid}|{uid}|{tid}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
-                    await UpsertFactVentas(dwhConn, order.OrderId, tid, detail.ProductId, cid, uid, detail.Quantity, detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
-                    processed++;
-                }
-            }
-
-            Console.WriteLine("[ETL] Procesando Fuente: Archivos CSV...");
-            foreach (var order in csvOrders)
-            {
-                if (!validClientes.Contains(order.CustomerID)) { skipped++; continue; }
-                DateTime date = order.OrderDate;
-                int tid = int.Parse(date.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, tid, date);
-                foreach (var d in csvLookup[order.OrderID])
-                {
-                    if (!validProductos.Contains(d.ProductID)) { skipped++; continue; }
-                    string key = $"CSV|{order.OrderID}|{d.ProductID}", state = $"{d.Quantity}|{d.TotalPrice}|{order.CustomerID}|0|{tid}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
-                    await UpsertFactVentas(dwhConn, order.OrderID, tid, d.ProductID, order.CustomerID, 0, d.Quantity, 0m, d.TotalPrice, "CSV");
-                    processed++;
-                }
-            }
-
-            Console.WriteLine("[ETL] Procesando Fuente: Servicio API...");
-            foreach (var order in apiOrders)
-            {
-                if (!validClientes.Contains(order.CustomerId)) { skipped++; continue; }
-                DateTime.TryParse(order.OrderDate, out DateTime date); if (date == default) date = DateTime.Today;
-                int tid = int.Parse(date.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, tid, date);
-                foreach (var d in apiLookup[order.OrderId])
-                {
-                    if (!validProductos.Contains(d.ProductId)) { skipped++; continue; }
-                    string key = $"API|{order.OrderId}|{d.ProductId}", state = $"{d.Quantity}|{d.TotalPrice}|{order.CustomerId}|0|{tid}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
-                    await UpsertFactVentas(dwhConn, order.OrderId, tid, d.ProductId, order.CustomerId, 0, d.Quantity, d.UnitPrice, d.TotalPrice, "API");
-                    processed++;
-                }
-            }
-            Console.WriteLine($"[ETL] Proceso Finalizado. [Actualizados/Nuevos: {processed}] [Sin cambios: {noChange}] [Omitidos: {skipped}]");
+            return new ExtractedData(
+                apiCustomers, apiOrders, apiOrderDetails,
+                csvOrders, csvOrderDetails,
+                dbCustomers, dbOrders, dbOrderDetails,
+                dbProducts, dbCities, dbCountries
+            );
         }
 
-        private static async Task MergeDimTiempo(SqlConnection conn, int timeId, DateTime date)
+        private async Task<ServiceResult> CleanDwhTablesAsync()
         {
-            await conn.ExecuteAsync(@"
-                MERGE Dim_Tiempo AS t
-                USING (SELECT @ID_Tiempo, @Fecha, @Anio, @Trimestre, @Mes, @Nombre_Mes, @Dia) AS s (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
-                ON t.ID_Tiempo = s.ID_Tiempo
-                WHEN NOT MATCHED THEN INSERT (ID_Tiempo, Fecha, Anio, Trimestre, Mes, Nombre_Mes, Dia)
-                VALUES (s.ID_Tiempo, s.Fecha, s.Anio, s.Trimestre, s.Mes, s.Nombre_Mes, s.Dia);",
-                new { ID_Tiempo = timeId, Fecha = date.Date, Anio = date.Year, Trimestre = (date.Month - 1) / 3 + 1, Mes = date.Month, Nombre_Mes = date.ToString("MMMM"), Dia = date.Day });
+            try
+            {
+                _logger.LogInformation("[ETL] Limpiando tablas del Data Warehouse...");
+                await _context.FactVentas.ExecuteDeleteAsync();
+                await _context.DimClientes.ExecuteDeleteAsync();
+                await _context.DimProductos.ExecuteDeleteAsync();
+                await _context.DimUbicaciones.ExecuteDeleteAsync();
+                await _context.DimTiempos.ExecuteDeleteAsync();
+                _logger.LogInformation("[ETL] Limpieza finalizada correctamente.");
+                return new ServiceResult { IsSuccess = true, Message = "Tablas limpiadas." };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[ETL] Error limpiando tablas.");
+                return new ServiceResult { IsSuccess = false, Message = $"Error limpiando: {ex.Message}" };
+            }
         }
 
-        private static async Task UpsertFactVentas(SqlConnection conn, int transId, int timeId, int productId, int clienteId, int ubicacionId, int cantidad, decimal unitPrice, decimal totalPrice, string origen)
+        private async Task LoadDimensionsAsync(ExtractedData data)
         {
-            await conn.ExecuteAsync(@"
-                MERGE Fact_Ventas AS t
-                USING (SELECT @ID_Transaccion, @ID_Tiempo, @ID_Producto, @ID_Cliente, @ID_Ubicacion, @Cantidad, @Precio_Unitario, @Total_Venta, @Origen_Datos) 
-                      AS s (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                ON t.ID_Transaccion = s.ID_Transaccion AND t.Origen_Datos = s.Origen_Datos AND t.ID_Producto = s.ID_Producto
-                WHEN MATCHED THEN 
-                    UPDATE SET ID_Tiempo = s.ID_Tiempo, ID_Cliente = s.ID_Cliente, ID_Ubicacion = s.ID_Ubicacion, 
-                               Cantidad = s.Cantidad, Precio_Unitario = s.Precio_Unitario, Total_Venta = s.Total_Venta
-                WHEN NOT MATCHED THEN 
-                    INSERT (ID_Transaccion, ID_Tiempo, ID_Producto, ID_Cliente, ID_Ubicacion, Cantidad, Precio_Unitario, Total_Venta, Origen_Datos)
-                    VALUES (s.ID_Transaccion, s.ID_Tiempo, s.ID_Producto, s.ID_Cliente, s.ID_Ubicacion, s.Cantidad, s.Precio_Unitario, s.Total_Venta, s.Origen_Datos);",
-                new { ID_Transaccion = transId, ID_Tiempo = timeId, ID_Producto = productId, ID_Cliente = clienteId, ID_Ubicacion = ubicacionId, Cantidad = cantidad, Precio_Unitario = unitPrice, Total_Venta = totalPrice, Origen_Datos = origen });
+            try 
+            {
+                _logger.LogInformation("[ETL] Cargando dimensiones...");
+
+                var newClientes = data.DbCustomers.Select(c => {
+                    var apiMatch = data.ApiCustomers.FirstOrDefault(a => a.Id == c.CustomerId);
+                    return new DimCliente {
+                        ID_Cliente = c.CustomerId,
+                        Nombre_Cliente = $"{c.FirstName} {c.LastName}",
+                        Tipo_Cliente = apiMatch?.CustomerType ?? "Regular"
+                    };
+                }).ToList();
+                if (!newClientes.Any(c => c.ID_Cliente == 0)) 
+                    newClientes.Add(new DimCliente { ID_Cliente = 0, Nombre_Cliente = "Cliente Desconocido", Tipo_Cliente = "N/A" });
+                await _context.DimClientes.AddRangeAsync(newClientes);
+
+                var newProds = data.DbProducts.Select(p => new DimProducto {
+                    ID_Producto = p.ProductId,
+                    Nombre_Producto = p.ProductName,
+                    Categoria = p.CategoryId.ToString(),
+                    Precio_Base = p.Price
+                }).ToList();
+                if (!newProds.Any(p => p.ID_Producto == 0))
+                    newProds.Add(new DimProducto { ID_Producto = 0, Nombre_Producto = "Producto N/A", Categoria = "N/A", Precio_Base = 0m });
+                await _context.DimProductos.AddRangeAsync(newProds);
+
+                var countryMap = data.DbCountries.ToDictionary(c => c.CountryId, c => c.CountryName);
+                var newLocs = data.DbCities.Select(city => {
+                    string paisName = (city.CountryId.HasValue && countryMap.TryGetValue(city.CountryId.Value, out var name)) ? name : "Unknown";
+                    return new DimUbicacion {
+                        ID_Ubicacion = city.CityId,
+                        Pais = paisName,
+                        Region = paisName,
+                        Ciudad = city.CityName
+                    };
+                }).ToList();
+                if (!newLocs.Any(l => l.ID_Ubicacion == 0))
+                    newLocs.Add(new DimUbicacion { ID_Ubicacion = 0, Pais = "N/A", Region = "N/A", Ciudad = "N/A" });
+                await _context.DimUbicaciones.AddRangeAsync(newLocs);
+
+                await _context.SaveChangesAsync();
+                _logger.LogInformation("[ETL] Dimensiones DimCliente ({C1}), DimProducto ({C2}), DimUbicacion ({C3}) cargadas.", 
+                    newClientes.Count, newProds.Count, newLocs.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[ETL] Error en LoadDimensionsAsync");
+                throw;
+            }
+        }
+
+        private async Task<ServiceResult> LoadFactVentasAsync(ExtractedData data)
+        {
+            try
+            {
+                _logger.LogInformation("[ETL] Cargando fact...");
+
+                var validClientes = await _context.DimClientes.ToDictionaryAsync(c => c.ID_Cliente);
+                var validProds = await _context.DimProductos.ToDictionaryAsync(p => p.ID_Producto);
+                var validLocs = await _context.DimUbicaciones.ToDictionaryAsync(u => u.ID_Ubicacion);
+
+                var allDates = data.DbOrders.Select(o => o.OrderDate ?? DateTime.Today)
+                    .Concat(data.CsvOrders.Select(o => o.OrderDate))
+                    .Concat(data.ApiOrders.Select(o => DateTime.TryParse(o.OrderDate, out var d) ? d : DateTime.Today))
+                    .Distinct()
+                    .ToList();
+
+                await LoadDimTiempoAsync(allDates);
+                var validTiempos = await _context.DimTiempos.ToDictionaryAsync(t => t.ID_Tiempo);
+
+                var factList = new List<FactVenta>();
+                int processed = 0, skipped = 0;
+
+                var dbLookup = data.DbOrderDetails.ToLookup(d => d.OrderId);
+                foreach (var order in data.DbOrders)
+                {
+                    int cid = order.CustomerId ?? 0, uid = data.DbCustomers.FirstOrDefault(c => c.CustomerId == cid)?.CityId ?? 0;
+                    int tid = int.Parse((order.OrderDate ?? DateTime.Today).ToString("yyyyMMdd"));
+
+                    if (!validClientes.ContainsKey(cid) || !validLocs.ContainsKey(uid) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
+
+                    var detailedLines = dbLookup[order.OrderId].GroupBy(d => d.ProductId);
+                    foreach (var group in detailedLines)
+                    {
+                        var first = group.First();
+                        if (!validProds.ContainsKey(first.ProductId)) { skipped++; continue; }
+                        
+                        int totalQty = group.Sum(g => g.Quantity);
+                        decimal totalPrice = group.Sum(g => g.TotalPrice ?? 0m);
+
+                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, cid, uid, totalQty, first.UnitPrice ?? 0m, totalPrice, "DB"));
+                        processed++;
+                        await CheckBatchSave(factList);
+                    }
+                }
+
+                var csvLookup = data.CsvOrderDetails.ToLookup(d => d.OrderID);
+                foreach (var order in data.CsvOrders)
+                {
+                    int tid = int.Parse(order.OrderDate.ToString("yyyyMMdd"));
+                    if (!validClientes.ContainsKey(order.CustomerID) || !validTiempos.ContainsKey(tid)) { skipped++; continue; }
+
+                    var detailedLines = csvLookup[order.OrderID].GroupBy(d => d.ProductID);
+                    foreach (var group in detailedLines)
+                    {
+                        var first = group.First();
+                        if (!validProds.ContainsKey(first.ProductID)) { skipped++; continue; }
+
+                        int totalQty = group.Sum(g => g.Quantity);
+                        decimal totalPrice = group.Sum(g => g.TotalPrice);
+
+                        factList.Add(CreateFact(order.OrderID, tid, first.ProductID, order.CustomerID, 0, totalQty, 0m, totalPrice, "CSV"));
+                        processed++;
+                        await CheckBatchSave(factList);
+                    }
+                }
+
+                var apiLookup = data.ApiOrderDetails.ToLookup(d => d.OrderId);
+                foreach (var order in data.ApiOrders)
+                {
+                    if (!validClientes.ContainsKey(order.CustomerId)) { skipped++; continue; }
+                    DateTime.TryParse(order.OrderDate, out DateTime date); if (date == default) date = DateTime.Today;
+                    int tid = int.Parse(date.ToString("yyyyMMdd"));
+                    if (!validTiempos.ContainsKey(tid)) { skipped++; continue; }
+
+                    var detailedLines = apiLookup[order.OrderId].GroupBy(d => d.ProductId);
+                    foreach (var group in detailedLines)
+                    {
+                        var first = group.First();
+                        if (!validProds.ContainsKey(first.ProductId)) { skipped++; continue; }
+
+                        int totalQty = group.Sum(g => g.Quantity);
+                        decimal totalPrice = group.Sum(g => g.TotalPrice);
+
+                        factList.Add(CreateFact(order.OrderId, tid, first.ProductId, order.CustomerId, 0, totalQty, first.UnitPrice, totalPrice, "API"));
+                        processed++;
+                        await CheckBatchSave(factList);
+                    }
+                }
+
+                if (factList.Any())
+                {
+                    await _context.FactVentas.AddRangeAsync(factList);
+                    await _context.SaveChangesAsync();
+                }
+
+                var msg = $"Proceso finalizado. [Cargados: {processed}] [Omitidos: {skipped}]";
+                _logger.LogInformation("[ETL] {Message}", msg);
+                return new ServiceResult { IsSuccess = true, Message = msg };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[ETL] Error en LoadFactVentasAsync");
+                return new ServiceResult { IsSuccess = false, Message = ex.Message };
+            }
+        }
+
+        private FactVenta CreateFact(int transId, int timeId, int prodId, int clieId, int ubicId, int qty, decimal price, decimal total, string source)
+        {
+            return new FactVenta {
+                ID_Transaccion = transId, ID_Tiempo = timeId, ID_Producto = prodId, ID_Cliente = clieId, ID_Ubicacion = ubicId,
+                Cantidad = qty, Precio_Unitario = price, Total_Venta = total, Origen_Datos = source
+            };
+        }
+
+        private async Task CheckBatchSave(List<FactVenta> factList)
+        {
+            if (factList.Count >= 1000)
+            {
+                await _context.FactVentas.AddRangeAsync(factList);
+                await _context.SaveChangesAsync();
+                factList.Clear();
+            }
+        }
+
+        private async Task LoadDimTiempoAsync(List<DateTime> dates)
+        {
+            var dateIds = dates.Select(d => int.Parse(d.ToString("yyyyMMdd"))).Distinct().ToList();
+            var existingIds = await _context.DimTiempos.Where(t => dateIds.Contains(t.ID_Tiempo)).Select(t => t.ID_Tiempo).ToListAsync();
+            var missingIds = dateIds.Except(existingIds).ToHashSet();
+            if (!missingIds.Any()) return;
+
+            var missingDates = dates.Where(d => missingIds.Contains(int.Parse(d.ToString("yyyyMMdd")))).DistinctBy(d => int.Parse(d.ToString("yyyyMMdd")))
+                .Select(date => new DimTiempo {
+                    ID_Tiempo = int.Parse(date.ToString("yyyyMMdd")), Fecha = date, Anio = date.Year, Trimestre = (date.Month - 1) / 3 + 1,
+                    Mes = date.Month, Nombre_Mes = date.ToString("MMMM", new CultureInfo("es-ES")), Dia = date.Day
+                }).ToList();
+
+            await _context.DimTiempos.AddRangeAsync(missingDates);
+            await _context.SaveChangesAsync();
+            _logger.LogInformation("[ETL] DimTiempo actualizada con {Count} nuevas fechas.", missingDates.Count);
         }
     }
 }
