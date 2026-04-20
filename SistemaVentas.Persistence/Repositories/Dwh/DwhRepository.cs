@@ -201,6 +201,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
                 int processed = 0, skipped = 0;
 
                 var dbLookup = data.DbOrderDetails.ToLookup(d => d.OrderId);
+
                 foreach (var order in data.DbOrders)
                 {
                     int cid = order.CustomerId ?? 0;
