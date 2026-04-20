@@ -28,40 +28,27 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
 
         public async Task LoadVentasDataAsync()
         {
-            // ─── 1. EXTRACT ────────────────────────────────────────────────
+            Console.WriteLine("[ETL] Iniciando extracción de datos fuentes...");
             var apiCustomers    = await _apiRepository.GetCustomersAsync();
             var apiOrders       = await _apiRepository.GetOrdersAsync();
             var apiOrderDetails = await _apiRepository.GetOrderDetailsAsync();
-
             var csvOrders       = await _csvRepository.GetVentasAsync();
             var csvOrderDetails = await _csvRepository.GetOrderDetailsAsync();
 
-            IEnumerable<Customer>    dbCustomers;
-            IEnumerable<Order>       dbOrders;
-            IEnumerable<OrderDetail> dbOrderDetails;
-            IEnumerable<Product>     dbProducts;
-            IEnumerable<City>        dbCities;
-            IEnumerable<Country>     dbCountries;
-
             using var ventasConn = new SqlConnection(_ventasConnectionString);
-            dbCustomers    = await ventasConn.QueryAsync<Customer>   ("SELECT * FROM Customer");
-            dbOrders       = await ventasConn.QueryAsync<Order>      ("SELECT * FROM [Order]");
-            dbOrderDetails = await ventasConn.QueryAsync<OrderDetail> ("SELECT * FROM Order_Detail");
-            dbProducts     = await ventasConn.QueryAsync<Product>    ("SELECT * FROM Product");
-            dbCities       = await ventasConn.QueryAsync<City>       ("SELECT * FROM City");
-            dbCountries    = await ventasConn.QueryAsync<Country>    ("SELECT * FROM Country");
+            var dbCustomers    = await ventasConn.QueryAsync<Customer>("SELECT * FROM Customer");
+            var dbOrders       = await ventasConn.QueryAsync<Order>("SELECT * FROM [Order]");
+            var dbOrderDetails = await ventasConn.QueryAsync<OrderDetail>("SELECT * FROM Order_Detail");
+            var dbProducts     = await ventasConn.QueryAsync<Product>("SELECT * FROM Product");
+            var dbCities       = await ventasConn.QueryAsync<City>("SELECT * FROM City");
+            var dbCountries    = await ventasConn.QueryAsync<Country>("SELECT * FROM Country");
 
-            // ─── DIAGNÓSTICO: conteo por fuente ───────────────────────────
-            Console.WriteLine($"[ETL] API  → Órdenes: {apiOrders.Count()}, Detalles: {apiOrderDetails.Count()}");
-            Console.WriteLine($"[ETL] CSV  → Órdenes: {csvOrders.Count()}, Detalles: {csvOrderDetails.Count()}");
-            Console.WriteLine($"[ETL] DB   → Órdenes: {dbOrders.Count()}, Detalles: {dbOrderDetails.Count()}");
+            Console.WriteLine($"[ETL] Extracción finalizada (API: {apiOrders.Count()}, CSV: {csvOrders.Count()}, DB: {dbOrders.Count()})");
 
-            // ─── 2. SIN TRUNCATE (Carga Incremental) ──────────────────────
             using var dwhConn = new SqlConnection(_dwhConnectionString);
             await dwhConn.OpenAsync();
-            Console.WriteLine("[ETL] Iniciando proceso incremental con Optimización Extrema ($O(1)$).");
 
-            // --- 2.1 Cache de Dimensiones para evitar MERGEs redundantes ---
+            Console.WriteLine("[ETL] Sincronizando dimensiones...");
             var dwhCustomers = (await dwhConn.QueryAsync("SELECT ID_Cliente, Nombre_Cliente, Tipo_Cliente FROM Dim_Cliente"))
                 .ToDictionary(c => (int)c.ID_Cliente, c => $"{c.Nombre_Cliente}|{c.Tipo_Cliente}");
 
@@ -71,21 +58,14 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             var dwhLocations = (await dwhConn.QueryAsync("SELECT ID_Ubicacion, Pais, Region, Ciudad FROM Dim_Ubicacion"))
                 .ToDictionary(l => (int)l.ID_Ubicacion, l => $"{l.Pais}|{l.Region}|{l.Ciudad}");
 
-            // --- 2.2 Upsert Inteligente de Dimensiones ---
             foreach (var cust in dbCustomers)
             {
                 var apiMatch = apiCustomers.FirstOrDefault(a => a.Id == cust.CustomerId);
-                string name = $"{cust.FirstName} {cust.LastName}";
-                string type = apiMatch?.CustomerType ?? "Regular";
-                string state = $"{name}|{type}";
-
-                if (!dwhCustomers.TryGetValue(cust.CustomerId, out var oldState) || oldState != state)
+                string name = $"{cust.FirstName} {cust.LastName}", type = apiMatch?.CustomerType ?? "Regular", state = $"{name}|{type}";
+                if (!dwhCustomers.TryGetValue(cust.CustomerId, out var old) || old != state)
                 {
-                    await dwhConn.ExecuteAsync(@"
-                        MERGE Dim_Cliente AS t
-                        USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente)
-                        ON t.ID_Cliente = s.ID_Cliente
-                        WHEN MATCHED     THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
+                    await dwhConn.ExecuteAsync(@"MERGE Dim_Cliente AS t USING (SELECT @ID_Cliente, @Nombre_Cliente, @Tipo_Cliente) AS s (ID_Cliente, Nombre_Cliente, Tipo_Cliente) ON t.ID_Cliente = s.ID_Cliente
+                        WHEN MATCHED THEN UPDATE SET Nombre_Cliente = s.Nombre_Cliente, Tipo_Cliente = s.Tipo_Cliente
                         WHEN NOT MATCHED THEN INSERT (ID_Cliente, Nombre_Cliente, Tipo_Cliente) VALUES (s.ID_Cliente, s.Nombre_Cliente, s.Tipo_Cliente);",
                         new { ID_Cliente = cust.CustomerId, Nombre_Cliente = name, Tipo_Cliente = type });
                 }
@@ -94,13 +74,10 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             foreach (var prod in dbProducts)
             {
                 string state = $"{prod.ProductName}|{prod.CategoryId}|{prod.Price}";
-                if (!dwhProducts.TryGetValue(prod.ProductId, out var oldState) || oldState != state)
+                if (!dwhProducts.TryGetValue(prod.ProductId, out var old) || old != state)
                 {
-                    await dwhConn.ExecuteAsync(@"
-                        MERGE Dim_Producto AS t
-                        USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base)
-                        ON t.ID_Producto = s.ID_Producto
-                        WHEN MATCHED     THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
+                    await dwhConn.ExecuteAsync(@"MERGE Dim_Producto AS t USING (SELECT @ID_Producto, @Nombre_Producto, @Categoria, @Precio_Base) AS s (ID_Producto, Nombre_Producto, Categoria, Precio_Base) ON t.ID_Producto = s.ID_Producto
+                        WHEN MATCHED THEN UPDATE SET Nombre_Producto = s.Nombre_Producto, Categoria = s.Categoria, Precio_Base = s.Precio_Base
                         WHEN NOT MATCHED THEN INSERT (ID_Producto, Nombre_Producto, Categoria, Precio_Base) VALUES (s.ID_Producto, s.Nombre_Producto, s.Categoria, s.Precio_Base);",
                         new { ID_Producto = prod.ProductId, Nombre_Producto = prod.ProductName, Categoria = prod.CategoryId.ToString(), Precio_Base = prod.Price });
                 }
@@ -109,125 +86,85 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             foreach (var city in dbCities)
             {
                 var country = dbCountries.FirstOrDefault(c => c.CountryId == city.CountryId);
-                string p = country?.CountryName ?? "Desconocido";
-                string r = country?.CountryName ?? "Desconocido";
-                string c = city.CityName;
-                string state = $"{p}|{r}|{c}";
-
-                if (!dwhLocations.TryGetValue(city.CityId, out var oldState) || oldState != state)
+                string p = country?.CountryName ?? "Unknown", r = p, c = city.CityName, state = $"{p}|{r}|{c}";
+                if (!dwhLocations.TryGetValue(city.CityId, out var old) || old != state)
                 {
-                    await dwhConn.ExecuteAsync(@"
-                        MERGE Dim_Ubicacion AS t
-                        USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad)
-                        ON t.ID_Ubicacion = s.ID_Ubicacion
-                        WHEN MATCHED     THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
+                    await dwhConn.ExecuteAsync(@"MERGE Dim_Ubicacion AS t USING (SELECT @ID_Ubicacion, @Pais, @Region, @Ciudad) AS s (ID_Ubicacion, Pais, Region, Ciudad) ON t.ID_Ubicacion = s.ID_Ubicacion
+                        WHEN MATCHED THEN UPDATE SET Pais = s.Pais, Region = s.Region, Ciudad = s.Ciudad
                         WHEN NOT MATCHED THEN INSERT (ID_Ubicacion, Pais, Region, Ciudad) VALUES (s.ID_Ubicacion, s.Pais, s.Region, s.Ciudad);",
                         new { ID_Ubicacion = city.CityId, Pais = p, Region = r, Ciudad = c });
                 }
             }
 
-            // --- 2.3 Cache de Hechos y Validaciones Estrictas ---
-            var existingFacts = (await dwhConn.QueryAsync(@"
-                SELECT ID_Transaccion, ID_Producto, Origen_Datos, Cantidad, 
-                       CAST(Total_Venta AS DECIMAL(18,2)) as Total_Venta, 
-                       ID_Cliente, ID_Ubicacion, ID_Tiempo
-                FROM Fact_Ventas"))
-                .GroupBy(f => $"{f.Origen_Datos}|{f.ID_Transaccion}|{f.ID_Producto}")
-                .ToDictionary(g => g.Key, g => {
-                    var f = g.First();
-                    return $"{f.Cantidad}|{f.Total_Venta}|{f.ID_Cliente}|{f.ID_Ubicacion}|{f.ID_Tiempo}";
-                });
+            Console.WriteLine("[ETL] Cargando historial del DWH para comparación...");
+            var existingFacts = (await dwhConn.QueryAsync("SELECT ID_Transaccion, ID_Producto, Origen_Datos, Cantidad, CAST(Total_Venta AS DECIMAL(18,2)) as Total_Venta, ID_Cliente, ID_Ubicacion, ID_Tiempo FROM Fact_Ventas"))
+                .GroupBy(f => $"{f.Origen_Datos}|{f.ID_Transaccion}|{f.ID_Producto}").ToDictionary(g => g.Key, g => { var f = g.First(); return $"{f.Cantidad}|{f.Total_Venta}|{f.ID_Cliente}|{f.ID_Ubicacion}|{f.ID_Tiempo}"; });
 
             var validClientes = (await dwhConn.QueryAsync<int>("SELECT ID_Cliente FROM Dim_Cliente")).ToHashSet();
             var validProductos = (await dwhConn.QueryAsync<int>("SELECT ID_Producto FROM Dim_Producto")).ToHashSet();
             var validUbicaciones = (await dwhConn.QueryAsync<int>("SELECT ID_Ubicacion FROM Dim_Ubicacion")).ToHashSet();
 
-            // --- 2.4 Lookups para Detalles ($O(1)$ search) ---
-            var dbDetailsLookup = dbOrderDetails.ToLookup(d => d.OrderId);
-            var csvDetailsLookup = csvOrderDetails.ToLookup(d => d.OrderID);
-            var apiDetailsLookup = apiOrderDetails.ToLookup(d => d.OrderId);
+            var dbLookup = dbOrderDetails.ToLookup(d => d.OrderId);
+            var csvLookup = csvOrderDetails.ToLookup(d => d.OrderID);
+            var apiLookup = apiOrderDetails.ToLookup(d => d.OrderId);
 
-            int dbProcessed = 0, csvProcessed = 0, apiProcessed = 0;
-            int skippedIntegrity = 0, noChangesCounter = 0;
+            int processed = 0, skipped = 0, noChange = 0;
 
-            // ─── 4. FACT_VENTAS — DB ──────────────────────────────────────
-            Console.WriteLine("[ETL] Procesando Fact_Ventas (DB)...");
+            Console.WriteLine("[ETL] Procesando Fuente: Base de Datos...");
             foreach (var order in dbOrders)
             {
                 var customer = dbCustomers.FirstOrDefault(c => c.CustomerId == order.CustomerId);
                 int cid = order.CustomerId ?? 0, uid = customer?.CityId ?? 0;
-                if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { skippedIntegrity++; continue; }
+                if (!validClientes.Contains(cid) || !validUbicaciones.Contains(uid)) { skipped++; continue; }
 
-                DateTime orderDate = order.OrderDate ?? DateTime.Today;
-                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
+                DateTime date = order.OrderDate ?? DateTime.Today;
+                int tid = int.Parse(date.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, tid, date);
 
-                foreach (var detail in dbDetailsLookup[order.OrderId])
+                foreach (var detail in dbLookup[order.OrderId])
                 {
-                    if (!validProductos.Contains(detail.ProductId)) { skippedIntegrity++; continue; }
-                    
-                    string key = $"DB|{order.OrderId}|{detail.ProductId}";
-                    string state = $"{detail.Quantity}|{detail.TotalPrice ?? 0m}|{cid}|{uid}|{timeId}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
-
-                    await UpsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId, cid, uid, detail.Quantity, detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
-                    dbProcessed++;
+                    if (!validProductos.Contains(detail.ProductId)) { skipped++; continue; }
+                    string key = $"DB|{order.OrderId}|{detail.ProductId}", state = $"{detail.Quantity}|{detail.TotalPrice ?? 0m}|{cid}|{uid}|{tid}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
+                    await UpsertFactVentas(dwhConn, order.OrderId, tid, detail.ProductId, cid, uid, detail.Quantity, detail.UnitPrice ?? 0m, detail.TotalPrice ?? 0m, "DB");
+                    processed++;
                 }
             }
 
-            // ─── 5. FACT_VENTAS — CSV ─────────────────────────────────────
-            Console.WriteLine("[ETL] Procesando Fact_Ventas (CSV)...");
+            Console.WriteLine("[ETL] Procesando Fuente: Archivos CSV...");
             foreach (var order in csvOrders)
             {
-                if (!validClientes.Contains(order.CustomerID)) { skippedIntegrity++; continue; }
-
-                DateTime orderDate = order.OrderDate;
-                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                foreach (var detail in csvDetailsLookup[order.OrderID])
+                if (!validClientes.Contains(order.CustomerID)) { skipped++; continue; }
+                DateTime date = order.OrderDate;
+                int tid = int.Parse(date.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, tid, date);
+                foreach (var d in csvLookup[order.OrderID])
                 {
-                    if (!validProductos.Contains(detail.ProductID)) { skippedIntegrity++; continue; }
-
-                    string key = $"CSV|{order.OrderID}|{detail.ProductID}";
-                    string state = $"{detail.Quantity}|{detail.TotalPrice}|{order.CustomerID}|0|{timeId}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
-
-                    await UpsertFactVentas(dwhConn, order.OrderID, timeId, detail.ProductID, order.CustomerID, 0, detail.Quantity, 0m, detail.TotalPrice, "CSV");
-                    csvProcessed++;
+                    if (!validProductos.Contains(d.ProductID)) { skipped++; continue; }
+                    string key = $"CSV|{order.OrderID}|{d.ProductID}", state = $"{d.Quantity}|{d.TotalPrice}|{order.CustomerID}|0|{tid}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
+                    await UpsertFactVentas(dwhConn, order.OrderID, tid, d.ProductID, order.CustomerID, 0, d.Quantity, 0m, d.TotalPrice, "CSV");
+                    processed++;
                 }
             }
 
-            // ─── 6. FACT_VENTAS — API ─────────────────────────────────────
-            Console.WriteLine("[ETL] Procesando Fact_Ventas (API)...");
+            Console.WriteLine("[ETL] Procesando Fuente: Servicio API...");
             foreach (var order in apiOrders)
             {
-                if (!validClientes.Contains(order.CustomerId)) { skippedIntegrity++; continue; }
-
-                DateTime.TryParse(order.OrderDate, out DateTime orderDate);
-                if (orderDate == default) orderDate = DateTime.Today;
-                int timeId = int.Parse(orderDate.ToString("yyyyMMdd"));
-                await MergeDimTiempo(dwhConn, timeId, orderDate);
-
-                foreach (var detail in apiDetailsLookup[order.OrderId])
+                if (!validClientes.Contains(order.CustomerId)) { skipped++; continue; }
+                DateTime.TryParse(order.OrderDate, out DateTime date); if (date == default) date = DateTime.Today;
+                int tid = int.Parse(date.ToString("yyyyMMdd"));
+                await MergeDimTiempo(dwhConn, tid, date);
+                foreach (var d in apiLookup[order.OrderId])
                 {
-                    if (!validProductos.Contains(detail.ProductId)) { skippedIntegrity++; continue; }
-
-                    string key = $"API|{order.OrderId}|{detail.ProductId}";
-                    string state = $"{detail.Quantity}|{detail.TotalPrice}|{order.CustomerId}|0|{timeId}";
-                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChangesCounter++; continue; }
-
-                    await UpsertFactVentas(dwhConn, order.OrderId, timeId, detail.ProductId, order.CustomerId, 0, detail.Quantity, detail.UnitPrice, detail.TotalPrice, "API");
-                    apiProcessed++;
+                    if (!validProductos.Contains(d.ProductId)) { skipped++; continue; }
+                    string key = $"API|{order.OrderId}|{d.ProductId}", state = $"{d.Quantity}|{d.TotalPrice}|{order.CustomerId}|0|{tid}";
+                    if (existingFacts.TryGetValue(key, out var old) && old == state) { noChange++; continue; }
+                    await UpsertFactVentas(dwhConn, order.OrderId, tid, d.ProductId, order.CustomerId, 0, d.Quantity, d.UnitPrice, d.TotalPrice, "API");
+                    processed++;
                 }
             }
-
-            Console.WriteLine("--------------------------------------------------");
-            Console.WriteLine($"[RESUMEN FINAL]");
-            Console.WriteLine($"→ Actualizados/Nuevos: {dbProcessed + csvProcessed + apiProcessed}");
-            Console.WriteLine($"→ Sincronizados (Sin cambios): {noChangesCounter}");
-            Console.WriteLine($"→ Omitidos (Calidad/ID 0): {skippedIntegrity}");
-            Console.WriteLine("--------------------------------------------------");
+            Console.WriteLine($"[ETL] Proceso Finalizado. [Actualizados/Nuevos: {processed}] [Sin cambios: {noChange}] [Omitidos: {skipped}]");
         }
 
         private static async Task MergeDimTiempo(SqlConnection conn, int timeId, DateTime date)

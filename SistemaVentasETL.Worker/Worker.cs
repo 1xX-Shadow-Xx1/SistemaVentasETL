@@ -22,29 +22,18 @@ namespace SistemaVentasETL.Worker
                 using var scope = _serviceProvider.CreateScope();
                 var handlerService = scope.ServiceProvider.GetRequiredService<IVentasHandlerService>();
 
-                _logger.LogInformation("Iniciando pipeline de extracción, transformación y carga...");
-                var result = await handlerService.ProcessVentasDataAsync();
-
-                if (result.IsSuccess)
-                {
-                    _logger.LogInformation("================================================");
-                    _logger.LogInformation("ETL COMPLETADO EXITOSAMENTE");
-                    _logger.LogInformation("Mensaje: {Message}", result.Message);
-                    _logger.LogInformation("================================================");
-                }
-                else
-                {
-                    _logger.LogWarning("ETL finalizado con advertencias: {Message}", result.Message);
-                }
+                _logger.LogInformation("[ETL] Iniciando proceso...");
+                await handlerService.ProcessVentasDataAsync();
+                _logger.LogInformation("[ETL] Proceso finalizado.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error crítico durante el proceso ETL: {Message}", ex.Message);
+                _logger.LogError(ex, "Error en el proceso ETL.");
             }
             finally
             {
-                _logger.LogInformation("La aplicación se cerrará en 5 minutos...");
-                await Task.Delay(5 * 60 * 1000);
+                _logger.LogInformation("La aplicación se cerrará en 1 minuto...");
+                await Task.Delay(1 * 60 * 1000);
                 Environment.Exit(0);
             }
         }
