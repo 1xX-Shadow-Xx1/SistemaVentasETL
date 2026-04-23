@@ -57,7 +57,7 @@ namespace SistemaVentas.Persistence.Repositories.Dwh
             var result = new ServiceResult();
             try
             {
-                _logger.LogInformation("[ETL] Proceso iniciado conforme al patrón del profesor.");
+                _logger.LogInformation("[ETL] Proceso iniciado");
 
                 var data = await ExtractDataSourcesAsync();
 
